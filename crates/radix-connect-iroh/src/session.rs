@@ -493,10 +493,12 @@ async fn serve(shared: &Shared, connection: &Connection) {
                 }
                 // If the peer stops waiting first, dropping `on_taken` withdraws the
                 // message from the host, and dropping `answer` resets the stream.
+                // A message the host already took is confirmed even if the session is
+                // closing at the same moment (best effort: closing may still cut it off).
                 let taken = tokio::select! {
                     biased;
-                    () = shared.wait_closed() => return,
                     taken = on_taken => taken.is_ok(),
+                    () = shared.wait_closed() => return,
                     () = answer.peer_gave_up() => false,
                 };
                 if taken {
