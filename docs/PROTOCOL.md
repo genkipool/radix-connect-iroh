@@ -80,10 +80,16 @@ Both sides install a hook that runs inside iroh for every connection:
 - after the handshake: close with application error `1` (`unauthorized`) any
   connection whose authenticated remote id is not the derived peer id.
 
-The connector checks the remote id again before using a connection. The wallet's
-endpoint registers no ALPN at all, so it refuses every incoming handshake.
+The connector checks the remote id again before using a connection.
 
-A connector accepts at most 4 handshakes in parallel and gives each 15 s.
+Before any handshake work, the connector screens connection attempts that arrive
+through the relay: the relay attests the sender's endpoint id (relay clients
+authenticate with their key), and attempts from any other id are ignored without an
+answer, so strangers cannot occupy handshake slots. Only direct UDP attempts — which a
+browser never receives — go unscreened into a pool of at most 8 parallel handshakes of
+15 s each, where any key can complete the TLS handshake and the hook then rejects it.
+
+The wallet's endpoint registers no ALPN and drops every incoming attempt unanswered.
 
 When an authenticated connection arrives while another one is active, the new one wins
 and the old one is closed with application error `2` (`replaced`): the wallet only
@@ -97,33 +103,43 @@ Every application message uses its own bidirectional stream:
 ```text
 sender                                   receiver
   open_bi ───────────────────────────────▶ accept_bi
-  write  <UTF-8 JSON message bytes>
-  finish ───────────────────────────────▶ read to end (≤ max size)
-                                           hand the message to the application
+  write  <length: u32 big-endian> <UTF-8 JSON message bytes>
+  finish ───────────────────────────────▶ read the length, then exactly that many bytes
+                                           queue it; wait until the application takes it
   read to end (≤ 1 byte) ◀──────────────── write <status byte>, finish
 ```
 
-Status byte: `0x00` received, `0x01` rejected (too large or not valid UTF-8). A receiver
-that refuses a message for its size also stops the stream with error code `1`.
+Status byte: `0x00` received, `0x01` rejected (too large, longer than announced, or not
+valid UTF-8). A receiver that refuses a message for its size also stops the stream with
+error code `1`. A stream that ends before the announced length, or is reset, is
+discarded without an answer. A sender that abandons a message (cancelled, timed out)
+resets its stream with error code `2` — never finishes it — so a partial message can
+never pass for a complete one.
 
 - The message is exactly the JSON text the WebRTC transport sends after reassembly — no
   chunks, no hashes, no `packageType` envelope: QUIC already provides reliability,
   integrity, flow control and encryption.
 - **Ordering:** a receiver reads one stream at a time, in the order the peer opened
   them, so messages are delivered in order (as over the ordered data channel).
-- **Confirmation:** `send` completes when the status byte arrives, i.e. after the
-  receiving side has queued the message for its application. This is the equivalent of
-  WebRTC's `receiveMessageConfirmation`, on which the extension's request queues rely.
+- **Confirmation:** `send` completes when the status byte arrives, which the receiver
+  writes only once its application has taken the message from the session. A message is
+  therefore never confirmed without having reached the application, even if the
+  receiving session closes right after. This is the equivalent of WebRTC's
+  `receiveMessageConfirmation`, on which the extension's request queues rely. If the
+  sender stops waiting first (timeout), it stops the stream and the receiver withdraws
+  the message, so a retry does not deliver it twice; the remaining window — the
+  application took the message but the status byte was lost with the connection — is
+  inherent to any acknowledgement and reported as `timeout`/`connectionLost`, which mean
+  "may have been delivered".
 - **Limits (defaults):** 8 MiB per message, 10 s for the confirmation (as WebRTC), 60 s
   for an incoming message to arrive completely, 16 concurrently open streams per peer,
   no unidirectional streams.
 - **Errors reported to the host:** `notConnected` (immediately, nothing sent),
-  `timeout` (may have been delivered), `messageTooLarge` (nothing sent), `rejected`,
-  `connectionLost`, `closed`.
+  `messageTooLarge` (nothing sent), `rejected` (refused by the peer, not delivered),
+  `timeout` and `connectionLost` (may have been delivered), `closed`.
 
-Messages are delivered to the host through an event queue of 64 entries; while it is
-full the session stops reading, so a host that cannot keep up makes the peer's sends
-time out instead of growing memory.
+The receiver reads the next message only after the application took the previous one,
+so a host that cannot keep up makes the peer's sends time out instead of growing memory.
 
 ## 7. Connection lifecycle
 
@@ -170,9 +186,18 @@ new exposure: whoever holds `P` can already take over the WebRTC link.
 timeouts and the bounded event queue cap what a peer — even an authenticated one — can
 make the other side buffer.
 
-**Implementation hygiene.** `P` and derived seeds are wiped from memory after use and
-never logged; the core crate forbids `unsafe`; the only `unsafe` code is the one-time
-Android JNI hand-over of the application context to iroh's DNS resolver.
+**Plain-HTTP relays.** Relays are reached over HTTPS; plain HTTP is accepted only for
+loopback, private and link-local addresses (development relays). Messages stay end-to-end
+encrypted either way, but over plain HTTP an on-path observer would also see the
+endpoint ids.
+
+**Implementation hygiene.** `P` and the derived seeds are never logged. The copies
+the library owns (the parsed password, the derived seed, the byte buffers handed over by
+the bindings) are wiped with `zeroize`; copies outside its control are not (the host's
+own `ByteArray`/`Uint8Array`, uniffi's transfer buffer, values moved through async state
+machines), which is why hosts keep `P` in their usual secure storage and pass it only
+when starting a session. The core crate forbids `unsafe`; the only `unsafe` code is the
+one-time Android JNI hand-over of the application context to iroh's DNS resolver.
 
 ## 9. Compatibility and coexistence with WebRTC
 

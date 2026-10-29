@@ -7,6 +7,10 @@ One session per link and per side. The wallet uses `role = wallet` (it dials), t
 Connector Extension uses `role = connector` (it waits for the wallet). The session
 reconnects by itself; the host only reads events and sends messages.
 
+Keep a loop reading `nextEvent()` for the whole life of a session: a message is
+confirmed to the sender only when the host takes it, so a host that stops reading makes
+the peer's sends time out.
+
 Messages are the same UTF-8 JSON strings the WebRTC data channel carries after
 reassembly (wallet interactions, responses, `linkClient`, `accountList`, ledger
 messages). No chunking, no `packageType` envelope.
@@ -42,13 +46,14 @@ class IrohSession : AutoCloseable {          // close() frees the native object
     fun peerEndpointId(): String
     fun state(): IrohConnectionState
     suspend fun send(message: String)         // throws IrohException; NotConnected immediately
-    suspend fun nextEvent(): IrohSessionEvent? // null once shut down
+    suspend fun nextEvent(): IrohSessionEvent? // null once shut down; taking a Message confirms it to the peer
     suspend fun networkChanged()              // call from ConnectivityManager callbacks
     suspend fun shutdown()                    // tells the peer, idempotent; then close()
 }
 
 fun irohDefaultRelayUrl(): String
 fun irohEndpointId(password: ByteArray, role: IrohRole): String
+fun irohValidateRelayUrl(relayUrl: String): String? // null when usable, else the reason
 
 enum class IrohLogLevel { ERROR, WARN, INFO, DEBUG, TRACE }
 interface IrohLogSink { fun log(level: IrohLogLevel, target: String, message: String) }
@@ -67,7 +72,7 @@ object RadixConnectIrohAndroid {
 
 ```ts
 import init, { IrohSession, defaultRelayUrl, endpointId, setLogger } from '@radixdlt/radix-connect-iroh'
-import wasmUrl from '@radixdlt/radix-connect-iroh/radix_connect_iroh_wasm_bg.wasm?url'
+import wasmUrl from '@radixdlt/radix-connect-iroh/radix_connect_iroh_bg.wasm?url'
 
 await init({ module_or_path: wasmUrl }) // once per page
 
@@ -87,11 +92,12 @@ class IrohSession {
   peerEndpointId(): string
   state(): IrohConnectionState
   send(message: string): Promise<void>
-  nextEvent(): Promise<IrohSessionEvent | undefined> // undefined once shut down
+  nextEvent(): Promise<IrohSessionEvent | undefined> // undefined once shut down; taking a message confirms it
   shutdown(): Promise<void>
   free(): void
 }
 function defaultRelayUrl(): string
 function endpointId(password: Uint8Array, role: IrohRole): string
+function validateRelayUrl(relayUrl: string): string | undefined // undefined when usable
 function setLogger(logger: (level: string, target: string, message: string) => void, maxLevel: 'error' | 'warn' | 'info' | 'debug' | 'trace'): void
 ```

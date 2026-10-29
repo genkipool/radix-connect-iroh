@@ -7,7 +7,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 RELAY_URL="${RELAY_URL:-http://localhost:3340}"
-PASSWORD="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+export RADIX_CONNECT_PASSWORD="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 WORK="$(mktemp -d)"
 trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
@@ -20,12 +20,12 @@ if [[ "$RELAY_URL" == "http://localhost:3340" ]]; then
     for _ in $(seq 50); do curl -s -o /dev/null "$RELAY_URL" && break; sleep 0.1; done
 fi
 
-node "$ROOT/js/test/e2e-connector.mjs" "$PASSWORD" "$RELAY_URL" >"$WORK/connector.out" 2>"$WORK/connector.err" &
+node "$ROOT/js/test/e2e-connector.mjs" "$RELAY_URL" >"$WORK/connector.out" 2>"$WORK/connector.err" &
 CONNECTOR=$!
 sleep 1
 
 # The wallet sends one request once connected and prints the answer.
-coproc WALLET { "$ROOT/target/debug/examples/peer" wallet "$PASSWORD" "$RELAY_URL" 2>"$WORK/wallet.err"; }
+coproc WALLET { "$ROOT/target/debug/examples/peer" wallet "$RELAY_URL" 2>"$WORK/wallet.err"; }
 while read -r -t 30 line <&"${WALLET[0]}"; do
     echo "wallet: $line"
     case "$line" in

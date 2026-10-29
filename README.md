@@ -50,8 +50,9 @@ iterations.
 extension without the other one:
 
 ```sh
-cargo run --example peer -- wallet    <password-hex> [relay-url]   # pretend to be the wallet
-cargo run --example peer -- connector <password-hex> [relay-url]   # pretend to be the extension
+export RADIX_CONNECT_PASSWORD=<password-hex>          # the link's connection password
+cargo run --example peer -- wallet    [relay-url]   # pretend to be the wallet
+cargo run --example peer -- connector [relay-url]   # pretend to be the extension
 ```
 
 Lines typed on stdin are sent as messages; events are printed.
@@ -68,8 +69,9 @@ iroh-relay --dev                              # local, plain HTTP on :3340
 iroh-relay --config-path relay.toml          # TLS (manual or Let's Encrypt), access control
 ```
 
-Browsers can only reach relays over `https://` (except `localhost`); Android blocks
-cleartext traffic by default, so use TLS for anything but local experiments.
+Plain `http://` relays are accepted only on loopback, private and link-local
+addresses (`scripts/dev-relay.sh` prints the URLs for each side). Use TLS for
+anything else.
 
 ## License
 

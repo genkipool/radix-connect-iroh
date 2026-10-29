@@ -101,7 +101,8 @@ pub enum IrohSessionEvent {
         /// The new state.
         state: IrohConnectionState,
     },
-    /// A message (UTF-8 JSON) arrived from the peer and was confirmed to it.
+    /// A message (UTF-8 JSON) arrived from the peer. Taking it from `next_event`
+    /// confirmed it to the peer.
     Message {
         /// The message.
         message: String,
@@ -285,7 +286,9 @@ impl IrohSession {
         Ok(())
     }
 
-    /// Waits for the next event; `None` once the session is shut down.
+    /// Waits for the next event; `None` once the session is shut down. Taking a
+    /// message confirms it to the peer: keep a loop calling this for the whole life
+    /// of the session.
     ///
     /// Polled directly by the caller rather than on the runtime: receiving is
     /// cancel-safe, so a cancelled call never loses an event.
@@ -309,6 +312,18 @@ impl IrohSession {
             return;
         };
         let _ = runtime.spawn(async move { session.close().await }).await;
+    }
+}
+
+impl Drop for IrohSession {
+    /// Freed without `shutdown()` (or with calls still running): close gracefully on
+    /// the runtime, which also keeps iroh's resources from being dropped on a foreign
+    /// thread outside of it. A no-op after `shutdown()`.
+    fn drop(&mut self) {
+        if let Ok(runtime) = runtime() {
+            let session = self.session.clone();
+            runtime.spawn(async move { session.close().await });
+        }
     }
 }
 

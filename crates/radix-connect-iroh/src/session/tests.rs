@@ -55,6 +55,14 @@ async fn next_message(session: &Session) -> String {
     .expect("timed out waiting for a message")
 }
 
+/// Sends `message` while the receiving host reads, as real hosts do: a message is only
+/// confirmed once the receiving host takes it.
+async fn deliver(sender: &Session, receiver: &Session, message: &str) -> Result<(), SendError> {
+    let (sent, received) = tokio::join!(sender.send(message), next_message(receiver));
+    assert_eq!(received, message);
+    sent
+}
+
 async fn connected_pair(relay_url: &RelayUrl, link: &ConnectionPassword) -> (Session, Session) {
     let connector = Session::start(link, Role::Connector, relay_only(relay_url))
         .await
@@ -77,12 +85,10 @@ async fn wallet_and_connector_exchange_messages_both_ways() {
     assert_eq!(connector.peer_id(), wallet.local_id());
 
     let request = r#"{"interactionId":"1","items":{"discriminator":"unauthorizedRequest"}}"#;
-    connector.send(request).await.unwrap();
-    assert_eq!(next_message(&wallet).await, request);
+    deliver(&connector, &wallet, request).await.unwrap();
 
     let response = r#"{"interactionId":"1","discriminator":"success"}"#;
-    wallet.send(response).await.unwrap();
-    assert_eq!(next_message(&connector).await, response);
+    deliver(&wallet, &connector, response).await.unwrap();
 
     wallet.close().await;
     connector.close().await;
@@ -93,12 +99,21 @@ async fn messages_keep_their_order() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let (connector, wallet) = connected_pair(&relay_url, &password(2)).await;
 
-    for index in 0..20 {
-        connector.send(&format!("{{\"n\":{index}}}")).await.unwrap();
-    }
-    for index in 0..20 {
-        assert_eq!(next_message(&wallet).await, format!("{{\"n\":{index}}}"));
-    }
+    // Concurrent sends are confirmed one by one, and read in the order they were sent.
+    let sends = (0..20).map(|index| {
+        let connector = &connector;
+        async move {
+            // Staggered so the streams are opened in index order.
+            time::sleep(Duration::from_millis(index * 5)).await;
+            connector.send(&format!("{{\"n\":{index}}}")).await
+        }
+    });
+    let (sent, ()) = tokio::join!(n0_future::join_all(sends), async {
+        for index in 0..20 {
+            assert_eq!(next_message(&wallet).await, format!("{{\"n\":{index}}}"));
+        }
+    });
+    assert!(sent.iter().all(Result::is_ok), "{sent:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -108,8 +123,7 @@ async fn large_messages_arrive_intact() {
 
     // Larger than any WebRTC chunk, and multi-byte characters straddle every boundary.
     let message = "ñ€😀".repeat(200_000);
-    wallet.send(&message).await.unwrap();
-    assert_eq!(next_message(&connector).await, message);
+    deliver(&wallet, &connector, &message).await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -127,15 +141,16 @@ async fn send_without_a_peer_fails_immediately() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_wallet_with_another_password_cannot_connect() {
+async fn a_stranger_cannot_connect() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(6);
-    let connector = Session::start(&link, Role::Connector, config(&relay_url))
+    // Relay-only, as in the browser: every attempt arrives with a relay-attested id.
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
         .await
         .unwrap();
 
     // A stranger who learned the connector's endpoint id, but not the password, dials
-    // it directly with an endpoint key of its own.
+    // it with an endpoint key of its own.
     let stranger = Endpoint::builder(presets::Minimal)
         .relay_mode(RelayMode::custom([relay_url.clone()]))
         .ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify())
@@ -143,6 +158,49 @@ async fn a_wallet_with_another_password_cannot_connect() {
         .await
         .unwrap();
     let target = EndpointAddr::new(connector.local_id()).with_relay_url(relay_url.clone());
+    // Ignored before any handshake work: no answer at all, so no handshake completes.
+    let attempt = time::timeout(Duration::from_secs(5), stranger.connect(target, ALPN)).await;
+    assert!(
+        !matches!(attempt, Ok(Ok(_))),
+        "a stranger completed a handshake: {attempt:?}"
+    );
+    assert_eq!(connector.state(), ConnectionState::Disconnected);
+    assert_eq!(connector.send("{}").await, Err(SendError::NotConnected));
+
+    // Meanwhile the link's own wallet still gets in.
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    stranger.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stranger_reaching_the_connector_directly_is_rejected_after_the_handshake() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(14);
+    // With UDP (native hosts), attempts can bypass the relay screening.
+    let connector = Session::start(&link, Role::Connector, config(&relay_url))
+        .await
+        .unwrap();
+    time::timeout(WAIT, connector.shared.endpoint.online())
+        .await
+        .unwrap();
+
+    let stranger = Endpoint::builder(presets::Minimal)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let direct = connector
+        .shared
+        .endpoint
+        .bound_sockets()
+        .into_iter()
+        .filter(std::net::SocketAddr::is_ipv4)
+        .map(|addr| std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())));
+    let target =
+        EndpointAddr::new(connector.local_id()).with_addrs(direct.map(iroh::TransportAddr::Ip));
     let attempt = time::timeout(WAIT, stranger.connect(target, ALPN))
         .await
         .unwrap();
@@ -160,8 +218,38 @@ async fn a_wallet_with_another_password_cannot_connect() {
         );
     }
     assert_eq!(connector.state(), ConnectionState::Disconnected);
-    assert_eq!(connector.send("{}").await, Err(SendError::NotConnected));
     stranger.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancelled_send_is_never_delivered() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(15)).await;
+
+    // Abandon a large send half way, repeatedly: the connector's host, reading all
+    // along, must never see a partial (or empty) message.
+    let large = "x".repeat(4 * 1024 * 1024);
+    for delay in [1, 5, 20, 50] {
+        let cut = time::timeout(Duration::from_millis(delay), wallet.send(&large)).await;
+        assert!(cut.is_err(), "the send finished within {delay} ms");
+        let leaked = time::timeout(Duration::from_millis(300), next_message(&connector)).await;
+        assert!(
+            leaked.is_err(),
+            "a cancelled send was delivered ({delay} ms)"
+        );
+    }
+    deliver(&wallet, &connector, "{\"after\":\"cancel\"}")
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_closed_session_reports_disconnected() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (_connector, wallet) = connected_pair(&relay_url, &password(16)).await;
+    assert_eq!(wallet.state(), ConnectionState::Connected);
+    wallet.close().await;
+    assert_eq!(wallet.state(), ConnectionState::Disconnected);
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -180,8 +268,9 @@ async fn the_wallet_reconnects_when_the_connector_restarts() {
     wait_for_state(&connector, ConnectionState::Connected).await;
     wait_for_state(&wallet, ConnectionState::Connected).await;
 
-    connector.send("{\"after\":\"restart\"}").await.unwrap();
-    assert_eq!(next_message(&wallet).await, "{\"after\":\"restart\"}");
+    deliver(&connector, &wallet, "{\"after\":\"restart\"}")
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -197,14 +286,17 @@ async fn a_new_wallet_connection_replaces_the_old_one() {
         .unwrap();
     wait_for_state(&second_wallet, ConnectionState::Connected).await;
 
-    time::timeout(WAIT, async {
-        while connector.send("{\"to\":\"second\"}").await.is_err() {
-            time::sleep(Duration::from_millis(50)).await;
-        }
-    })
-    .await
-    .unwrap();
-    assert_eq!(next_message(&second_wallet).await, "{\"to\":\"second\"}");
+    // The connector may still hold the old connection for a moment.
+    let (sent, received) = tokio::join!(
+        time::timeout(WAIT, async {
+            while connector.send("{\"to\":\"second\"}").await.is_err() {
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        }),
+        next_message(&second_wallet)
+    );
+    sent.unwrap();
+    assert_eq!(received, "{\"to\":\"second\"}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -238,8 +330,9 @@ async fn oversized_messages_are_refused() {
         Err(SendError::Rejected)
     );
     // The link keeps working afterwards.
-    wallet.send("{\"still\":\"alive\"}").await.unwrap();
-    assert_eq!(next_message(&connector).await, "{\"still\":\"alive\"}");
+    deliver(&wallet, &connector, "{\"still\":\"alive\"}")
+        .await
+        .unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -255,31 +348,59 @@ async fn a_closed_session_stops_cleanly() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn an_unconfirmed_message_times_out() {
+async fn a_message_the_host_does_not_take_is_not_confirmed() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(12);
-    let _connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
         .await
         .unwrap();
-    let mut wallet_config = config(&relay_url).with_ack_timeout(Duration::from_millis(300));
-    wallet_config.max_message_size = 64;
+    let wallet_config = config(&relay_url).with_ack_timeout(Duration::from_millis(300));
     let wallet = Session::start(&link, Role::Wallet, wallet_config)
         .await
         .unwrap();
     wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
 
-    // The connector's host never consumes its events: once its buffer is full it
-    // stops acknowledging, and the wallet's next send times out.
-    let mut results = Vec::new();
-    for _ in 0..EVENT_BUFFER + 2 {
-        let result = wallet.send("{}").await;
-        let timed_out = result == Err(SendError::Timeout);
-        results.push(result);
-        if timed_out {
-            break;
-        }
-    }
-    let (last, earlier) = results.split_last().unwrap();
-    assert_eq!(last, &Err(SendError::Timeout));
-    assert!(earlier.iter().all(Result::is_ok), "{earlier:?}");
+    // The connector's host is not reading: nothing confirms the message.
+    assert_eq!(
+        wallet.send("{\"late\":true}").await,
+        Err(SendError::Timeout)
+    );
+
+    // The wallet gave up on it, so it must not reach the host afterwards either: a
+    // retry would otherwise deliver it twice.
+    time::sleep(Duration::from_millis(500)).await;
+    let late = time::timeout(Duration::from_millis(500), next_message(&connector)).await;
+    assert!(late.is_err(), "a withdrawn message was delivered: {late:?}");
+
+    // A message the host takes in time is confirmed, and the link keeps working.
+    let (sent, received) = tokio::join!(wallet.send("{\"on\":\"time\"}"), next_message(&connector));
+    assert_eq!(sent, Ok(()));
+    assert_eq!(received, "{\"on\":\"time\"}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_withdraws_messages_the_host_has_not_taken() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(13);
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+
+    // The connector closes while the wallet's message waits for its host: the wallet
+    // must learn it was not delivered rather than get a confirmation.
+    let (sent, ()) = tokio::join!(wallet.send("{}"), async {
+        time::sleep(Duration::from_millis(300)).await;
+        connector.close().await;
+    });
+    assert!(
+        matches!(sent, Err(SendError::ConnectionLost(_) | SendError::Timeout)),
+        "{sent:?}"
+    );
+    assert_eq!(connector.next_event().await, None);
 }

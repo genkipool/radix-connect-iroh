@@ -3,8 +3,8 @@
 // Waits for the wallet, receives one message, answers it and exits.
 import { IrohSession, setLogger } from '../dist-nodejs/radix_connect_iroh.js'
 
-const [passwordHex, relayUrl] = process.argv.slice(2)
-const password = Uint8Array.from(Buffer.from(passwordHex, 'hex'))
+const [relayUrl] = process.argv.slice(2)
+const password = Uint8Array.from(Buffer.from(process.env.RADIX_CONNECT_PASSWORD, 'hex'))
 setLogger((level, target, message) => console.error(`[${level}] ${target}: ${message}`), 'info')
 
 const session = await IrohSession.start(password, 'connector', relayUrl, 10_000)

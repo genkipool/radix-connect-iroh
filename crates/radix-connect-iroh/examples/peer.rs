@@ -2,12 +2,13 @@
 //! real Connector Extension (or against another `peer`).
 //!
 //! ```text
-//! cargo run --example peer -- <wallet|connector> <password-hex> [relay-url]
+//! RADIX_CONNECT_PASSWORD=<password-hex> cargo run --example peer -- <wallet|connector> [relay-url]
 //! ```
 //!
 //! Every line read from stdin is sent as one message; events are printed to stdout as
 //! `state <state>` and `message <json>` lines. The password is the link's 64-character
-//! hex connection password.
+//! hex connection password; it is read from the environment rather than the command
+//! line, which other local users can see.
 
 use std::process::ExitCode;
 
@@ -29,13 +30,14 @@ async fn main() -> ExitCode {
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
-    let usage = "usage: peer <wallet|connector> <password-hex> [relay-url]";
+    let usage = "usage: RADIX_CONNECT_PASSWORD=<password-hex> peer <wallet|connector> [relay-url]";
     let role = match args.next().as_deref() {
         Some("wallet") => Role::Wallet,
         Some("connector") => Role::Connector,
         _ => return Err(usage.into()),
     };
-    let password = ConnectionPassword::from_hex(&args.next().ok_or(usage)?)?;
+    let password =
+        ConnectionPassword::from_hex(&std::env::var("RADIX_CONNECT_PASSWORD").map_err(|_| usage)?)?;
     let relay_url = args.next().unwrap_or_else(|| DEFAULT_RELAY_URL.to_owned());
 
     let session = Session::start(&password, role, SessionConfig::new(&relay_url)?).await?;

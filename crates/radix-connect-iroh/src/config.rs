@@ -53,8 +53,9 @@ pub struct SessionConfig {
 impl SessionConfig {
     /// Default settings using the relay server at `relay_url`.
     ///
-    /// The URL must be an absolute `https://` URL (or `http://` for a relay running
-    /// on the developer's machine or network) without credentials.
+    /// The URL must be an absolute `https://` URL without credentials. Plain `http://`
+    /// is accepted only for loopback, private and link-local hosts (a development relay
+    /// on this machine or the local network).
     pub fn new(relay_url: &str) -> Result<Self, Error> {
         Ok(Self {
             relay_url: parse_relay_url(relay_url)?,
@@ -105,7 +106,27 @@ fn parse_relay_url(input: &str) -> Result<RelayUrl, Error> {
     if !url.username().is_empty() || url.password().is_some() {
         return Err(invalid("the URL must not contain credentials"));
     }
+    if url.scheme() == "http" && !url.host().is_some_and(|host| is_local(&host)) {
+        return Err(invalid(
+            "plain http is only allowed for relays on this machine or the local network",
+        ));
+    }
     Ok(url)
+}
+
+/// Loopback, private and link-local addresses, and `localhost`.
+fn is_local(host: &url::Host<&str>) -> bool {
+    match host {
+        url::Host::Domain(domain) => {
+            let domain = domain.trim_end_matches('.');
+            domain.eq_ignore_ascii_case("localhost")
+                || domain.to_ascii_lowercase().ends_with(".localhost")
+        }
+        url::Host::Ipv4(ip) => ip.is_loopback() || ip.is_private() || ip.is_link_local(),
+        url::Host::Ipv6(ip) => {
+            ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +142,10 @@ mod tests {
     fn accepts_https_and_local_http_relays() {
         assert!(SessionConfig::new("https://relay.example.com").is_ok());
         assert!(SessionConfig::new("http://192.168.1.20:3340").is_ok());
+        assert!(SessionConfig::new("http://localhost:3340").is_ok());
+        assert!(SessionConfig::new("http://127.0.0.1:3340").is_ok());
+        assert!(SessionConfig::new("http://[::1]:3340").is_ok());
+        assert!(SessionConfig::new("http://10.0.0.7:3340").is_ok());
         assert!(SessionConfig::new("  https://relay.example.com/  ").is_ok());
     }
 
@@ -134,6 +159,9 @@ mod tests {
             "https://user:secret@relay.example.com",
             "https://user@relay.example.com",
             "file:///etc/passwd",
+            "http://relay.example.com",
+            "http://8.8.8.8:3340",
+            "http://[2001:db8::1]:3340",
         ] {
             assert!(
                 matches!(SessionConfig::new(input), Err(Error::InvalidRelayUrl(_))),

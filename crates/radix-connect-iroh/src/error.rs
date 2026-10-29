@@ -35,10 +35,11 @@ pub enum SendError {
         /// Configured maximum in bytes.
         max: usize,
     },
-    /// The peer received the message but refused it (too large or not UTF-8).
+    /// The peer refused the message (too large or not UTF-8); it was not delivered.
     #[error("the peer rejected the message")]
     Rejected,
-    /// The connection broke while sending.
+    /// The connection broke while sending. As with a timeout, the peer may or may
+    /// not have received the message.
     #[error("the connection was lost: {0}")]
     ConnectionLost(String),
     /// The session has been closed.

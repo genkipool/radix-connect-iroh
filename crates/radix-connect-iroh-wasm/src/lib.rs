@@ -15,7 +15,8 @@ use radix_connect_iroh::logging::{format_event, host_log_enabled};
 use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use wasm_bindgen::prelude::*;
-use wasm_bindgen_futures::future_to_promise;
+use wasm_bindgen_futures::{future_to_promise, spawn_local};
+use zeroize::Zeroize;
 
 #[wasm_bindgen(typescript_custom_section)]
 const TYPES: &'static str = r#"
@@ -105,7 +106,7 @@ fn event_to_js(event: core::SessionEvent) -> JsValue {
 /// Takes ownership of the JS copy of the password and wipes it once parsed.
 fn password_from(mut bytes: Vec<u8>) -> Result<core::ConnectionPassword, JsValue> {
     let password = core::ConnectionPassword::from_slice(&bytes);
-    bytes.fill(0);
+    bytes.zeroize();
     password.map_err(error_from)
 }
 
@@ -173,6 +174,8 @@ impl IrohSession {
     }
 
     /// Resolves with the next event, or `undefined` once the session is shut down.
+    /// Taking a message confirms it to the peer: keep a loop calling this for the
+    /// whole life of the session.
     #[wasm_bindgen(js_name = nextEvent, unchecked_return_type = "Promise<IrohSessionEvent | undefined>")]
     pub fn next_event(&self) -> Promise {
         let session = self.session.clone();
@@ -193,6 +196,15 @@ impl IrohSession {
             session.close().await;
             Ok(JsValue::UNDEFINED)
         })
+    }
+}
+
+impl Drop for IrohSession {
+    /// `free()` without `shutdown()`, or with calls still pending: close the session
+    /// anyway, so it stops accepting the wallet. A no-op after `shutdown()`.
+    fn drop(&mut self) {
+        let session = self.session.clone();
+        spawn_local(async move { session.close().await });
     }
 }
 

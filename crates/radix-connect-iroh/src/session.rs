@@ -1,23 +1,34 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use iroh::endpoint::{Connection, QuicTransportConfig, presets};
+use iroh::endpoint::{Connection, IncomingAddr, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
 use n0_future::task::{self, AbortOnDropHandle};
 use n0_future::{FuturesUnordered, StreamExt, time};
-use tokio::sync::{Mutex, Notify, mpsc, watch};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
 use crate::guard::PeerGuard;
 use crate::protocol::{self, ALPN, CloseCode, Incoming};
 use crate::{ConnectionPassword, Error, Role, SendError, SessionConfig};
 
-/// Events buffered for the host before the session stops reading from the peer.
+/// Events buffered for the host. At most one of them is a message: the next message is
+/// only read once the host has taken the previous one.
 const EVENT_BUFFER: usize = 64;
 
-/// Incoming handshakes processed at the same time by the Connector Extension. Only
-/// the link's wallet can complete one, so this only bounds the work a stranger who
-/// guessed the endpoint id can cause.
-const MAX_PENDING_HANDSHAKES: usize = 4;
+/// How long creating the local endpoint may take.
+const BIND_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long [`Session::close`] waits for the endpoint to close gracefully.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Incoming handshakes the Connector Extension processes at the same time.
+///
+/// Connections arriving through the relay are screened before any handshake work: the
+/// relay attests the sender's endpoint id, and anyone but the link's wallet is ignored.
+/// Only direct (UDP) connection attempts, which a browser never receives, reach this
+/// pool unscreened; any key can complete a handshake, the guard hook rejects strangers
+/// only afterwards.
+const MAX_PENDING_HANDSHAKES: usize = 8;
 
 /// How long an incoming QUIC handshake may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -42,8 +53,20 @@ pub enum ConnectionState {
 pub enum SessionEvent {
     /// The connection state changed.
     StateChanged(ConnectionState),
-    /// A message arrived from the peer. It has already been confirmed to the peer.
+    /// A message arrived from the peer. Taking it from
+    /// [`next_event`](Session::next_event) confirms it to the peer.
     Message(String),
+}
+
+/// What the session queues for the host.
+#[derive(Debug)]
+enum Queued {
+    State(ConnectionState),
+    /// `taken` tells the stream that delivered the message to confirm it.
+    Message {
+        message: String,
+        taken: oneshot::Sender<()>,
+    },
 }
 
 /// One end of a Radix Connect link over iroh.
@@ -57,7 +80,7 @@ pub enum SessionEvent {
 #[derive(Debug)]
 pub struct Session {
     shared: Arc<Shared>,
-    events: Mutex<mpsc::Receiver<SessionEvent>>,
+    events: Mutex<mpsc::Receiver<Queued>>,
     _driver: AbortOnDropHandle<()>,
 }
 
@@ -70,7 +93,9 @@ struct Shared {
     connection: watch::Sender<Option<Connection>>,
     state: watch::Sender<ConnectionState>,
     closed: watch::Sender<bool>,
-    events: mpsc::Sender<SessionEvent>,
+    /// Set by the driver once it stopped and closed the endpoint.
+    stopped: watch::Sender<bool>,
+    events: mpsc::Sender<Queued>,
     /// Cuts the wallet's wait before the next dial attempt short.
     redial: Notify,
 }
@@ -114,9 +139,9 @@ impl Session {
                 builder = builder.clear_ip_transports();
             }
         }
-        let endpoint = builder
-            .bind()
+        let endpoint = time::timeout(BIND_TIMEOUT, builder.bind())
             .await
+            .map_err(|_| Error::Bind("timed out".to_owned()))?
             .map_err(|error| Error::Bind(error.to_string()))?;
 
         let initial_state = match role {
@@ -132,6 +157,7 @@ impl Session {
             connection: watch::Sender::new(None),
             state: watch::Sender::new(initial_state),
             closed: watch::Sender::new(false),
+            stopped: watch::Sender::new(false),
             events: events_tx,
             redial: Notify::new(),
         });
@@ -170,7 +196,8 @@ impl Session {
         *self.shared.state.borrow()
     }
 
-    /// Sends one message to the peer and waits until the peer confirms it.
+    /// Sends one message to the peer and waits until the peer confirms it, which the
+    /// peer does when its host takes the message from its session.
     ///
     /// Fails immediately with [`SendError::NotConnected`] when there is no
     /// connection, like the WebRTC transport does, so callers can queue and retry.
@@ -195,14 +222,30 @@ impl Session {
 
     /// Waits for the next event. Returns `None` once the session is closed.
     ///
-    /// Events are buffered; while the host does not consume them the session stops
-    /// accepting messages, so the peer's sends time out instead of piling up.
+    /// Taking a message confirms it to the peer, so a message is never confirmed
+    /// without having reached the host. Until the host takes it the session reads no
+    /// further message, and the peer's sends time out rather than pile up.
+    ///
+    /// Cancel-safe: a cancelled call neither loses nor confirms a message.
     pub async fn next_event(&self) -> Option<SessionEvent> {
         let mut events = self.events.lock().await;
-        tokio::select! {
-            biased;
-            () = self.shared.wait_closed() => None,
-            event = events.recv() => event,
+        loop {
+            let queued = tokio::select! {
+                biased;
+                () = self.shared.wait_closed() => return None,
+                queued = events.recv() => queued?,
+            };
+            match queued {
+                Queued::State(state) => return Some(SessionEvent::StateChanged(state)),
+                // The stream that brought the message is gone (the peer gave up waiting
+                // or the connection ended): the peer was not confirmed and will send it
+                // again if it still matters, so delivering it now could duplicate it.
+                Queued::Message { message, taken } => {
+                    if taken.send(()).is_ok() {
+                        return Some(SessionEvent::Message(message));
+                    }
+                }
+            }
         }
     }
 
@@ -215,16 +258,22 @@ impl Session {
         self.shared.endpoint.network_change().await;
     }
 
-    /// Closes the connection (telling the peer) and the endpoint. Idempotent.
+    /// Closes the connection (telling the peer) and the endpoint, and waits until both
+    /// are closed. Idempotent, and cancel-safe: the endpoint is closed by the session's
+    /// own task even if this call is abandoned.
     pub async fn close(&self) {
-        if self.shared.closed.send_replace(true) {
-            return;
+        if !self.shared.closed.send_replace(true) {
+            self.shared
+                .state
+                .send_replace(ConnectionState::Disconnected);
+            if let Some(connection) = self.shared.connection.send_replace(None) {
+                connection.close(CloseCode::Normal.into(), b"closed");
+            }
         }
-        if let Some(connection) = self.shared.connection.send_replace(None) {
-            connection.close(CloseCode::Normal.into(), b"closed");
-        }
-        self.shared.endpoint.close().await;
-        tracing::info!(local = %self.local_id().fmt_short(), "radix connect iroh session closed");
+        let mut stopped = self.shared.stopped.subscribe();
+        // `wait_for` only fails if the sender is dropped, which outlives `self`. The
+        // bound keeps a peer that never acknowledges the close from blocking the host.
+        let _ = time::timeout(CLOSE_TIMEOUT, stopped.wait_for(|stopped| *stopped)).await;
     }
 }
 
@@ -240,7 +289,7 @@ impl Shared {
     }
 
     /// Queues an event for the host. Returns `false` once the session is closing.
-    async fn emit(&self, event: SessionEvent) -> bool {
+    async fn emit(&self, event: Queued) -> bool {
         tokio::select! {
             biased;
             () = self.wait_closed() => false,
@@ -248,7 +297,12 @@ impl Shared {
         }
     }
 
+    /// Records and reports a state change. Only the driver calls it, from one task,
+    /// so reported states follow the real order. Nothing changes once closed.
     async fn set_state(&self, state: ConnectionState) {
+        if self.is_closed() {
+            return;
+        }
         let changed = self.state.send_if_modified(|current| {
             let changed = *current != state;
             *current = state;
@@ -256,29 +310,24 @@ impl Shared {
         });
         if changed {
             tracing::debug!(?state, peer = %self.peer.fmt_short(), "connection state changed");
-            self.emit(SessionEvent::StateChanged(state)).await;
+            self.emit(Queued::State(state)).await;
         }
-    }
-
-    /// Forgets `connection` if it is still the current one. Returns whether it was.
-    fn clear_connection(&self, connection: &Connection) -> bool {
-        self.connection.send_if_modified(|current| {
-            let is_current = current
-                .as_ref()
-                .is_some_and(|c| c.stable_id() == connection.stable_id());
-            if is_current {
-                *current = None;
-            }
-            is_current
-        })
     }
 }
 
 async fn drive(shared: Arc<Shared>) {
     match shared.role {
-        Role::Wallet => dial(&shared).await,
+        Role::Wallet => {
+            tokio::select! {
+                () = dial(&shared) => {}
+                () = ignore_incoming(&shared) => {}
+            }
+        }
         Role::Connector => accept(&shared).await,
     }
+    shared.endpoint.close().await;
+    shared.stopped.send_replace(true);
+    tracing::info!(local = %shared.endpoint.id().fmt_short(), "radix connect iroh session closed");
 }
 
 /// Wallet: keep dialing the Connector Extension, and serve each connection until it
@@ -301,7 +350,9 @@ async fn dial(shared: &Arc<Shared>) {
             Ok(Ok(connection)) => {
                 delay = shared.config.min_reconnect_delay;
                 shared.connection.send_replace(Some(connection.clone()));
-                serve(shared, connection).await;
+                shared.set_state(ConnectionState::Connected).await;
+                serve(shared, &connection).await;
+                shared.connection.send_replace(None);
             }
             Ok(Err(error)) => tracing::debug!(%error, "could not reach the connector extension"),
             Err(_) => tracing::debug!("dialing the connector extension timed out"),
@@ -315,16 +366,44 @@ async fn dial(shared: &Arc<Shared>) {
     }
 }
 
+/// Wallet: drop every incoming connection attempt without answering. The endpoint has
+/// no ALPN, so none could succeed, but unaccepted attempts would pile up in memory.
+async fn ignore_incoming(shared: &Shared) {
+    loop {
+        let incoming = tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            incoming = shared.endpoint.accept() => incoming,
+        };
+        match incoming {
+            Some(incoming) => incoming.ignore(),
+            None => return,
+        }
+    }
+}
+
 /// Connector Extension: accept the wallet's connections. A new connection replaces the
 /// current one: the wallet only dials again when it believes the old one is gone
 /// (network change, app restart), and the old one may take a while to time out.
+///
+/// This loop is the only place that changes the connector's connection and state, so
+/// a connection that ends while a newer one is being set up cannot leave a stale
+/// `Disconnected` behind.
 async fn accept(shared: &Arc<Shared>) {
     let mut handshakes = FuturesUnordered::new();
-    let mut _serving: Option<AbortOnDropHandle<()>> = None;
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<usize>();
+    let mut serving: Option<(usize, AbortOnDropHandle<()>)> = None;
     loop {
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
+            Some(ended) = ended_rx.recv() => {
+                if serving.as_ref().is_some_and(|(id, _)| *id == ended) {
+                    serving = None;
+                    shared.connection.send_replace(None);
+                    shared.set_state(ConnectionState::Disconnected).await;
+                }
+            }
             Some(handshake) = handshakes.next(), if !handshakes.is_empty() => {
                 let connection: Connection = match handshake {
                     Ok(Ok(connection)) => connection,
@@ -343,21 +422,36 @@ async fn accept(shared: &Arc<Shared>) {
                     connection.close(CloseCode::Unauthorized.into(), b"unauthorized");
                     continue;
                 }
+                let id = connection.stable_id();
                 if let Some(previous) = shared.connection.send_replace(Some(connection.clone())) {
                     previous.close(CloseCode::Replaced.into(), b"replaced");
                 }
+                let ended = ended_tx.clone();
+                let task_shared = shared.clone();
                 // Replacing the handle stops serving the previous connection.
-                _serving = Some(AbortOnDropHandle::new(task::spawn(serve_owned(
-                    shared.clone(),
-                    connection,
-                ))));
+                serving = Some((
+                    id,
+                    AbortOnDropHandle::new(task::spawn(async move {
+                        serve(&task_shared, &connection).await;
+                        let _ = ended.send(id);
+                    })),
+                ));
+                shared.set_state(ConnectionState::Connected).await;
             }
             incoming = shared.endpoint.accept() => {
                 let Some(incoming) = incoming else {
                     return;
                 };
+                // Through the relay, the sender's id is known before any handshake work.
+                if let IncomingAddr::Relay { endpoint_id, .. } = incoming.remote_addr()
+                    && endpoint_id != shared.peer
+                {
+                    tracing::debug!(remote = %endpoint_id.fmt_short(), "ignoring a connection attempt from a stranger");
+                    incoming.ignore();
+                    continue;
+                }
                 if handshakes.len() >= MAX_PENDING_HANDSHAKES {
-                    incoming.refuse();
+                    incoming.ignore();
                     continue;
                 }
                 match incoming.accept() {
@@ -369,46 +463,53 @@ async fn accept(shared: &Arc<Shared>) {
     }
 }
 
-async fn serve_owned(shared: Arc<Shared>, connection: Connection) {
-    serve(&shared, connection).await;
-}
-
-/// Delivers the peer's messages, one stream at a time, until the connection ends.
-async fn serve(shared: &Shared, connection: Connection) {
+/// Delivers the peer's messages, one stream at a time, until the connection ends or
+/// the session closes. Each message is confirmed only once the host took it.
+async fn serve(shared: &Shared, connection: &Connection) {
     tracing::info!(peer = %shared.peer.fmt_short(), "connected to the peer");
-    shared.set_state(ConnectionState::Connected).await;
     loop {
         let stream = tokio::select! {
             biased;
             () = shared.wait_closed() => return,
             stream = connection.accept_bi() => stream,
         };
-        let (mut send, mut recv) = match stream {
+        let (send, mut recv) = match stream {
             Ok(stream) => stream,
             Err(error) => {
                 tracing::info!(%error, "connection to the peer ended");
-                break;
+                return;
             }
         };
         let read = time::timeout(
             shared.config.receive_timeout,
-            protocol::read_message(&mut send, &mut recv, shared.config.max_message_size),
+            protocol::read_message(send, &mut recv, shared.config.max_message_size),
         )
         .await;
         match read {
-            Ok(Ok(Incoming::Message(message))) => {
-                if !shared.emit(SessionEvent::Message(message)).await {
+            Ok(Ok(Incoming::Message(message, answer))) => {
+                let (taken, on_taken) = oneshot::channel();
+                if !shared.emit(Queued::Message { message, taken }).await {
                     return;
                 }
-                protocol::acknowledge(&mut send).await;
+                // If the peer stops waiting first, dropping `on_taken` withdraws the
+                // message from the host, and dropping `answer` resets the stream.
+                let taken = tokio::select! {
+                    biased;
+                    () = shared.wait_closed() => return,
+                    taken = on_taken => taken.is_ok(),
+                    () = answer.peer_gave_up() => false,
+                };
+                if taken {
+                    answer.acknowledge().await;
+                }
             }
-            Ok(Ok(Incoming::Refused)) => {}
+            Ok(Ok(Incoming::Refused | Incoming::Incomplete)) => {}
             Ok(Err(error)) => tracing::debug!(%error, "could not read an incoming message"),
-            Err(_) => tracing::warn!("an incoming message did not arrive in time"),
+            Err(_) => {
+                let _ = recv.stop(0u32.into());
+                tracing::warn!("an incoming message did not arrive in time");
+            }
         }
-    }
-    if shared.clear_connection(&connection) && !shared.is_closed() {
-        shared.set_state(ConnectionState::Disconnected).await;
     }
 }
 
