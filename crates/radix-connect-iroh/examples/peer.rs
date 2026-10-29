@@ -1,0 +1,68 @@
+//! A command-line end of a link, to try the transport against the real wallet or the
+//! real Connector Extension (or against another `peer`).
+//!
+//! ```text
+//! cargo run --example peer -- <wallet|connector> <password-hex> [relay-url]
+//! ```
+//!
+//! Every line read from stdin is sent as one message; events are printed to stdout as
+//! `state <state>` and `message <json>` lines. The password is the link's 64-character
+//! hex connection password.
+
+use std::process::ExitCode;
+
+use radix_connect_iroh::{
+    ConnectionPassword, DEFAULT_RELAY_URL, Role, Session, SessionConfig, SessionEvent,
+};
+use tokio::io::{AsyncBufReadExt, BufReader};
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    match run().await {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut args = std::env::args().skip(1);
+    let usage = "usage: peer <wallet|connector> <password-hex> [relay-url]";
+    let role = match args.next().as_deref() {
+        Some("wallet") => Role::Wallet,
+        Some("connector") => Role::Connector,
+        _ => return Err(usage.into()),
+    };
+    let password = ConnectionPassword::from_hex(&args.next().ok_or(usage)?)?;
+    let relay_url = args.next().unwrap_or_else(|| DEFAULT_RELAY_URL.to_owned());
+
+    let session = Session::start(&password, role, SessionConfig::new(&relay_url)?).await?;
+    eprintln!(
+        "{role:?} {} -> peer {} via {relay_url}",
+        session.local_id(),
+        session.peer_id()
+    );
+
+    let mut stdin = BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        tokio::select! {
+            event = session.next_event() => match event {
+                Some(SessionEvent::StateChanged(state)) => println!("state {state:?}"),
+                Some(SessionEvent::Message(message)) => println!("message {message}"),
+                None => break,
+            },
+            line = stdin.next_line() => match line? {
+                Some(line) if line.trim().is_empty() => {}
+                Some(line) => match session.send(line.trim()).await {
+                    Ok(()) => println!("sent"),
+                    Err(error) => println!("send-failed {error}"),
+                },
+                None => break,
+            },
+        }
+    }
+    session.close().await;
+    Ok(())
+}

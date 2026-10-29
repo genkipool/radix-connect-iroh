@@ -1,0 +1,9 @@
+/target
+jvm/.gradle/
+jvm/**/build/
+jvm/local.properties
+js/dist/
+js/node_modules/
+*.iml
+.idea/
+js/dist-*/

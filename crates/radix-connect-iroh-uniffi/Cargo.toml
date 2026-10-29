@@ -1,0 +1,39 @@
+[package]
+name = "radix-connect-iroh-uniffi"
+description = "Kotlin/Swift (uniffi) bindings of radix-connect-iroh for the Radix Wallet."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "radix_connect_iroh_uniffi"
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["cli"]
+
+[features]
+cli = ["uniffi/cli"]
+
+[dependencies]
+radix-connect-iroh.workspace = true
+n0-future.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "time"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uniffi = "0.31.2"
+zeroize.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+iroh.workspace = true
+jni = "0.21"
+
+[lints]
+workspace = true

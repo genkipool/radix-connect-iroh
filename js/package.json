@@ -1,0 +1,30 @@
+{
+  "name": "@radixdlt/radix-connect-iroh",
+  "version": "0.1.0",
+  "description": "Radix Connect over iroh for browsers: the Connector Extension's side of the iroh transport (WebAssembly).",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/genkipool/radix-connect-iroh"
+  },
+  "type": "module",
+  "main": "./dist/radix_connect_iroh.js",
+  "types": "./dist/radix_connect_iroh.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/radix_connect_iroh.d.ts",
+      "default": "./dist/radix_connect_iroh.js"
+    },
+    "./radix_connect_iroh_bg.wasm": "./dist/radix_connect_iroh_bg.wasm"
+  },
+  "files": [
+    "dist/radix_connect_iroh.js",
+    "dist/radix_connect_iroh.d.ts",
+    "dist/radix_connect_iroh_bg.wasm",
+    "dist/radix_connect_iroh_bg.wasm.d.ts"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "../scripts/build-wasm.sh web"
+  }
+}

@@ -1,0 +1,27 @@
+[package]
+name = "radix-connect-iroh-wasm"
+description = "Browser (wasm-bindgen) bindings of radix-connect-iroh for the Radix Connector Extension."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+radix-connect-iroh.workspace = true
+js-sys = "0.3"
+n0-future.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+# Pinned exactly: the generated JS glue must come from the same wasm-bindgen version
+# as the `wasm-bindgen` CLI used in scripts/build-wasm.sh.
+wasm-bindgen = "=0.2.129"
+wasm-bindgen-futures = "0.4"
+
+[lints]
+workspace = true

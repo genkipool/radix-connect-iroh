@@ -1,0 +1,133 @@
+//! Forwards the library's `tracing` events to a logger of the host (Timber on
+//! Android), so iroh problems show up next to the app's own logs.
+
+use std::sync::{Arc, Once, RwLock};
+
+use radix_connect_iroh::logging::{format_event, host_log_enabled};
+use tracing::{Event, Level, Metadata, Subscriber};
+use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+/// Severity of a log line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, uniffi::Enum)]
+pub enum IrohLogLevel {
+    /// Something failed.
+    Error,
+    /// Something unexpected happened.
+    Warn,
+    /// Lifecycle (session started, connected, disconnected...).
+    Info,
+    /// Details useful when diagnosing a connection.
+    Debug,
+    /// Everything.
+    Trace,
+}
+
+impl From<IrohLogLevel> for Level {
+    fn from(level: IrohLogLevel) -> Self {
+        match level {
+            IrohLogLevel::Error => Self::ERROR,
+            IrohLogLevel::Warn => Self::WARN,
+            IrohLogLevel::Info => Self::INFO,
+            IrohLogLevel::Debug => Self::DEBUG,
+            IrohLogLevel::Trace => Self::TRACE,
+        }
+    }
+}
+
+impl From<Level> for IrohLogLevel {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::ERROR => Self::Error,
+            Level::WARN => Self::Warn,
+            Level::INFO => Self::Info,
+            Level::DEBUG => Self::Debug,
+            Level::TRACE => Self::Trace,
+        }
+    }
+}
+
+/// Receives the library's log lines. Called from the library's own threads.
+#[uniffi::export(with_foreign)]
+pub trait IrohLogSink: Send + Sync {
+    /// One log line.
+    fn log(&self, level: IrohLogLevel, target: String, message: String);
+}
+
+struct Installed {
+    sink: Arc<dyn IrohLogSink>,
+    max_level: Level,
+}
+
+static SINK: RwLock<Option<Installed>> = RwLock::new(None);
+static SUBSCRIBER: Once = Once::new();
+
+/// Sends log lines up to `max_level` to `sink`, replacing any previous sink. iroh and
+/// QUIC internals are capped (see `radix_connect_iroh::logging::host_log_enabled`).
+#[uniffi::export]
+pub fn iroh_install_log_sink(sink: Arc<dyn IrohLogSink>, max_level: IrohLogLevel) {
+    if let Ok(mut installed) = SINK.write() {
+        *installed = Some(Installed {
+            sink,
+            max_level: max_level.into(),
+        });
+    }
+    SUBSCRIBER.call_once(|| {
+        let subscriber = tracing_subscriber::registry().with(SinkLayer);
+        // Fails only if the process already has a global subscriber, which then
+        // receives our events instead.
+        let _ = tracing::subscriber::set_global_default(subscriber);
+    });
+    tracing::callsite::rebuild_interest_cache();
+}
+
+fn enabled(metadata: &Metadata<'_>) -> bool {
+    SINK.read().ok().is_some_and(|installed| {
+        installed.as_ref().is_some_and(|installed| {
+            host_log_enabled(metadata.target(), *metadata.level(), installed.max_level)
+        })
+    })
+}
+
+struct SinkLayer;
+
+impl<S: Subscriber> Layer<S> for SinkLayer {
+    fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
+        enabled(metadata)
+    }
+
+    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+        let metadata = event.metadata();
+        if !enabled(metadata) {
+            return;
+        }
+        let sink = SINK
+            .read()
+            .ok()
+            .and_then(|installed| installed.as_ref().map(|installed| installed.sink.clone()));
+        if let Some(sink) = sink {
+            sink.log(
+                (*metadata.level()).into(),
+                metadata.target().to_owned(),
+                format_event(event),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_round_trip() {
+        for level in [
+            IrohLogLevel::Error,
+            IrohLogLevel::Warn,
+            IrohLogLevel::Info,
+            IrohLogLevel::Debug,
+            IrohLogLevel::Trace,
+        ] {
+            assert_eq!(IrohLogLevel::from(Level::from(level)), level);
+        }
+    }
+}

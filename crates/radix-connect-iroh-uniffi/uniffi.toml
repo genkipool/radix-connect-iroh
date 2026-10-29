@@ -1,0 +1,6 @@
+[bindings.kotlin]
+package_name = "com.radixdlt.connect.iroh"
+cdylib_name = "radix_connect_iroh_uniffi"
+
+[bindings.swift]
+module_name = "RadixConnectIroh"

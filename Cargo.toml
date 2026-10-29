@@ -1,0 +1,64 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/radix-connect-iroh",
+    "crates/radix-connect-iroh-uniffi",
+    "crates/radix-connect-iroh-wasm",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/genkipool/radix-connect-iroh"
+authors = ["Luis Alberto Reoyo Bolaños <68571366+genkipool@users.noreply.github.com>"]
+
+[workspace.dependencies]
+radix-connect-iroh = { path = "crates/radix-connect-iroh", version = "0.1.0" }
+
+# `default-features = false` drops metrics, the UPnP/NAT-PMP port mapper and the Apple
+# datapath: none of them is needed to reach a relay, and the port mapper does not build
+# for the browser. `tls-ring` keeps one crypto provider on every target (aws-lc-rs needs
+# cmake/clang for Android and does not build for wasm).
+iroh = { version = "1.4.1", default-features = false, features = ["tls-ring"] }
+blake3 = { version = "1.8", default-features = false }
+hex = "0.4"
+n0-future = "0.3"
+thiserror = "2"
+tokio = { version = "1.44", default-features = false, features = ["sync", "macros"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["std", "registry"] }
+zeroize = { version = "1.8", features = ["derive"] }
+
+# `unsafe_code` is forbidden in the core crate itself (`#![forbid(unsafe_code)]`); the
+# binding crates cannot forbid it because uniffi and wasm-bindgen generate FFI glue.
+[workspace.lints.rust]
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = "debuginfo"
+
+# Shipped inside the wallet APK, once per ABI: optimise for size. Exported symbols (the
+# uniffi and JNI entry points) survive `strip = "symbols"`.
+[profile.release-android]
+inherits = "release"
+opt-level = "s"
+strip = "symbols"
+
+# The browser build is downloaded with the extension: optimise for size.
+[profile.release-wasm]
+inherits = "release"
+opt-level = "z"
+strip = "symbols"
