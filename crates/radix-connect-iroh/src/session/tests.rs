@@ -414,6 +414,10 @@ async fn closing_withdraws_messages_the_host_has_not_taken() {
 async fn diagnostics_describe_a_healthy_link() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let (connector, wallet) = connected_pair(&relay_url, &password(17)).await;
+    // The relay-only connector talks to the wallet through the relay: that counts as
+    // connected to it even before iroh reports its home relay.
+    let early = connector.diagnostics();
+    assert!(early.relay_connected, "{early}");
     time::timeout(WAIT, wallet.shared.endpoint.online())
         .await
         .unwrap();
