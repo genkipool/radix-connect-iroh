@@ -2622,7 +2622,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radix-connect-iroh"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "blake3",
  "hex",
@@ -2638,7 +2638,7 @@ dependencies = [
 
 [[package]]
 name = "radix-connect-iroh-uniffi"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "iroh",
  "jni 0.21.1",
@@ -2654,7 +2654,7 @@ dependencies = [
 
 [[package]]
 name = "radix-connect-iroh-wasm"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "js-sys",
  "n0-future",
