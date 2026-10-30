@@ -15,6 +15,11 @@ wallet and the extension keep all their logic and only gain a transport.
 - **One Rust implementation** for both ends: Kotlin bindings (uniffi) for the Android
   wallet, WebAssembly bindings (wasm-bindgen) for the browser extension.
 
+> **Status:** community project, proposed to RDX Works for the Radix Wallet and the
+> Radix Connector Extension; not an official Radix package. The `com.radixdlt` and
+> `@radixdlt` package coordinates below are the proposed ones and are not published.
+> Until the official wallet and extension support it, use it with development builds.
+
 Specification and security analysis: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Binding
 APIs: [`docs/BINDINGS.md`](docs/BINDINGS.md).
 
