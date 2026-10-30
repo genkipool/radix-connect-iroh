@@ -220,6 +220,8 @@ impl Session {
             &connection,
             message,
             self.shared.config.max_message_size,
+            // The receiver allows this long for a message to arrive; so does the sender.
+            self.shared.config.receive_timeout,
             self.shared.config.ack_timeout,
         )
         .await;
@@ -420,7 +422,9 @@ fn with_relays(
                     .relay_mode(RelayMode::custom([test.relay_url.clone()]))
                     .preset(test.lookup.preset());
             }
-            let builder = builder.relay_mode(RelayMode::Default);
+            // `default_relay_mode` honours IROH_FORCE_STAGING_RELAYS, as n0's address
+            // lookup does, so relays and lookup never point at different deployments.
+            let builder = builder.relay_mode(iroh::endpoint::default_relay_mode());
             match role {
                 Role::Connector => builder
                     .addr_filter(AddrFilter::relay_only())
@@ -495,13 +499,17 @@ async fn dial(shared: &Arc<Shared>) {
         };
         match outcome {
             Ok(Ok(connection)) => {
-                delay = shared.config.min_reconnect_delay;
                 shared.connection.send_replace(Some(connection.clone()));
                 shared.record_connected();
                 shared.set_state(ConnectionState::Connected).await;
                 let ended = serve(shared, &connection).await;
                 shared.connection.send_replace(None);
                 shared.record_disconnected(ended);
+                let replaced = was_replaced(&connection);
+                if replaced {
+                    tracing::warn!("another session took over this link; backing off");
+                }
+                delay = delay_after_connection(replaced, &shared.config);
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "could not reach the connector");
@@ -634,24 +642,72 @@ async fn accept(shared: &Arc<Shared>) {
                 let Some(incoming) = incoming else {
                     return;
                 };
-                // Through the relay, the sender's id is known before any handshake work.
-                if let IncomingAddr::Relay { endpoint_id, .. } = incoming.remote_addr()
-                    && endpoint_id != shared.peer
-                {
-                    tracing::debug!(remote = %endpoint_id.fmt_short(), "ignoring a connection attempt from a stranger");
-                    incoming.ignore();
-                    continue;
-                }
-                if handshakes.len() >= MAX_PENDING_HANDSHAKES {
-                    incoming.ignore();
-                    continue;
-                }
-                match incoming.accept() {
-                    Ok(accepting) => handshakes.push(time::timeout(HANDSHAKE_TIMEOUT, accepting)),
-                    Err(error) => tracing::debug!(%error, "could not accept an incoming connection"),
+                let decision = admission(
+                    &incoming.remote_addr(),
+                    incoming.remote_addr_validated(),
+                    shared.peer,
+                    handshakes.len(),
+                );
+                match decision {
+                    Admission::Handshake => match incoming.accept() {
+                        Ok(accepting) => handshakes.push(time::timeout(HANDSHAKE_TIMEOUT, accepting)),
+                        Err(error) => tracing::debug!(%error, "could not accept an incoming connection"),
+                    },
+                    // Costs us nothing: a genuine sender answers, a spoofed source cannot.
+                    Admission::ValidateAddress => {
+                        if let Err(error) = incoming.retry() {
+                            error.into_incoming().ignore();
+                        }
+                    }
+                    Admission::Ignore => {
+                        tracing::debug!(addr = ?incoming.remote_addr(), "ignoring a connection attempt");
+                        incoming.ignore();
+                    }
                 }
             }
         }
+    }
+}
+
+/// Delay before redialing once a connection ended. When another session holding this
+/// link's key (another device, or a second app instance) took over, redialing at once
+/// would just take the link back, and the two would keep replacing each other.
+fn delay_after_connection(replaced: bool, config: &SessionConfig) -> Duration {
+    if replaced {
+        config.max_reconnect_delay
+    } else {
+        config.min_reconnect_delay
+    }
+}
+
+fn was_replaced(connection: &Connection) -> bool {
+    matches!(
+        connection.close_reason(),
+        Some(iroh::endpoint::ConnectionError::ApplicationClosed(close))
+            if close.error_code == CloseCode::Replaced.into()
+    )
+}
+
+/// What to do with an incoming connection attempt, before any handshake work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Handshake,
+    /// Ask the sender to prove it can receive at its source address first.
+    ValidateAddress,
+    Ignore,
+}
+
+/// Through the relay the sender's id is attested before any handshake work: the
+/// link's wallet is always let in (strangers can never fill its way), anyone else is
+/// ignored. Direct attempts (native connectors only; a browser has no UDP) must first
+/// prove their source address, then share the bounded handshake pool.
+fn admission(addr: &IncomingAddr, validated: bool, peer: EndpointId, pending: usize) -> Admission {
+    match addr {
+        IncomingAddr::Relay { endpoint_id, .. } if *endpoint_id == peer => Admission::Handshake,
+        IncomingAddr::Relay { .. } => Admission::Ignore,
+        _ if !validated => Admission::ValidateAddress,
+        _ if pending >= MAX_PENDING_HANDSHAKES => Admission::Ignore,
+        _ => Admission::Handshake,
     }
 }
 

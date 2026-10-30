@@ -19,7 +19,8 @@ ledger requests and responses), so nothing above the transport changes.
   untouched, and links created before this transport existed work over it.
 - Only the two holders of a link's connection password can reach each other; relays
   see neither the messages nor the password.
-- No dependency on a discovery service: nothing about an endpoint is published.
+- Minimal publication: with the default public relays only the connector publishes
+  which relay it uses (never an IP address); with a custom relay nothing is published.
 
 ## 2. Roles
 
@@ -85,19 +86,26 @@ Both sides install a hook that runs inside iroh for every connection:
 
 The connector checks the remote id again before using a connection.
 
-Before any handshake work, the connector screens connection attempts that arrive
-through the relay: the relay attests the sender's endpoint id (relay clients
-authenticate with their key), and attempts from any other id are ignored without an
-answer, so strangers cannot occupy handshake slots. Only direct UDP attempts — which a
-browser never receives — go unscreened into a pool of at most 8 parallel handshakes of
-15 s each, where any key can complete the TLS handshake and the hook then rejects it.
+Before any handshake work, the connector screens connection attempts:
+
+- Through the relay the sender's endpoint id is attested (relay clients authenticate
+  with their key): the link's wallet is always let in, attempts from any other id are
+  ignored without an answer.
+- Direct UDP attempts — which a browser never receives — must first prove they can
+  receive at their source address (a stateless QUIC retry), then share a pool of at
+  most 8 parallel handshakes of 15 s each, where any key can complete the TLS handshake
+  and the hook then rejects it. Filling that pool never keeps the wallet out, since its
+  attempts through the relay bypass it.
 
 The wallet's endpoint registers no ALPN and drops every incoming attempt unanswered.
 
 When an authenticated connection arrives while another one is active, the new one wins
 and the old one is closed with application error `2` (`replaced`): the wallet only
 dials again when it believes the previous connection is dead (app restart, network
-change), and a dead QUIC connection can take a while to time out.
+change), and a dead QUIC connection can take a while to time out. A wallet whose
+connection was replaced waits the longest back-off before dialing again, so two
+sessions holding the same key (another device, a second app instance) do not keep
+taking the link from each other.
 
 ## 6. Messages
 
@@ -127,16 +135,23 @@ never pass for a complete one.
 - **Confirmation:** `send` completes when the status byte arrives, which the receiver
   writes only once its application has taken the message from the session. A message is
   therefore never confirmed without having reached the application, even if the
-  receiving session closes right after. This is the equivalent of WebRTC's
-  `receiveMessageConfirmation`, on which the extension's request queues rely. If the
+  receiving session closes right after. It plays the role of WebRTC's
+  `receiveMessageConfirmation`, on which the extension's request queues rely, but is
+  stronger: WebRTC confirms once the chunks are reassembled, iroh once the application
+  took the message. Hosts must therefore keep reading events while they send — a host
+  that waits for its own send before reading would leave the peer's messages
+  unconfirmed. If the
   sender stops waiting first (timeout), it stops the stream and the receiver withdraws
   the message, so a retry does not deliver it twice; the remaining window — the
   application took the message but the status byte was lost with the connection — is
   inherent to any acknowledgement and reported as `timeout`/`connectionLost`, which mean
   "may have been delivered".
-- **Limits (defaults):** 8 MiB per message, 10 s for the confirmation (as WebRTC), 60 s
-  for an incoming message to arrive completely, 16 concurrently open streams per peer,
-  no unidirectional streams.
+- **Timeouts:** getting a message across (open, write, the peer acknowledging every
+  byte) and getting it confirmed are bounded separately, so a large message on a slow
+  link is not cut short by the confirmation timeout.
+- **Limits (defaults):** 8 MiB per message; 60 s for a message to get across, in both
+  directions; 10 s for the confirmation once it arrived (as WebRTC); 16 concurrently
+  open streams per peer; no unidirectional streams.
 - **Errors reported to the host:** `notConnected` (immediately, nothing sent),
   `messageTooLarge` (nothing sent), `rejected` (refused by the peer, not delivered),
   `timeout` and `connectionLost` (may have been delivered), `closed`.
@@ -173,8 +188,10 @@ leak of `P` does not decrypt recorded sessions.
 link, their IP addresses, when they are online, and the timing and size of encrypted
 packets. With the public relays, n0's address lookup also stores, per connector
 endpoint id, which relay it uses (a signed record that contains no IP address and
-nothing about the user). Because ids are derived per link, neither can correlate the
-links of one wallet or one browser. With a custom relay nothing is published. A malicious relay — or a tampered lookup record, which the
+nothing about the user). Because ids are derived per link, the ids themselves do not
+link the links of one wallet or one browser; whoever operates a relay or the lookup can
+still correlate them by IP address and timing, as a signaling or TURN server can today.
+With a custom relay nothing is published. A malicious relay — or a tampered lookup record, which the
 connector's signature prevents — can drop traffic (denial of service), like a signaling
 or TURN server can today, but cannot read or forge it: the QUIC handshake still
 authenticates the derived endpoint keys. Relay TLS certificates

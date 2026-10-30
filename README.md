@@ -9,8 +9,9 @@ wallet and the extension keep all their logic and only gain a transport.
   connection password, so the QR code, the stored links and the linking flow do not
   change.
 - **End-to-end encrypted and mutually authenticated** (QUIC / TLS 1.3 with Ed25519 raw
-  public keys); relays only forward ciphertext and nothing is published to discovery
-  services.
+  public keys); relays only forward ciphertext. With the default public relays the
+  connector publishes which relay it uses (never its IP address); with a custom relay
+  nothing is published.
 - **One Rust implementation** for both ends: Kotlin bindings (uniffi) for the Android
   wallet, WebAssembly bindings (wasm-bindgen) for the browser extension.
 

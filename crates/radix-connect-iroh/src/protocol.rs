@@ -77,9 +77,12 @@ impl GuardedSendStream {
         self.stream()?.write_all(bytes).await
     }
 
-    fn finish(mut self) -> Result<(), WriteError> {
+    /// Finishes the stream, disarming the guard, and returns it so the caller can wait
+    /// for the peer to acknowledge the data.
+    fn finish(mut self) -> Result<SendStream, WriteError> {
         let mut stream = self.0.take().ok_or(WriteError::ClosedStream)?;
-        stream.finish().map_err(|_| WriteError::ClosedStream)
+        stream.finish().map_err(|_| WriteError::ClosedStream)?;
+        Ok(stream)
     }
 }
 
@@ -92,10 +95,15 @@ impl Drop for GuardedSendStream {
 }
 
 /// Sends `message` on a new stream and waits for the peer's status byte.
+///
+/// Two separate bounds: `transfer_timeout` for getting the whole message to the peer
+/// (open, write, and the peer acknowledging every byte), so that a large message on a
+/// slow link is not cut short; then `ack_timeout` for the peer's host to take it.
 pub(crate) async fn send_message(
     conn: &Connection,
     message: &str,
     max_message_size: usize,
+    transfer_timeout: Duration,
     ack_timeout: Duration,
 ) -> Result<(), SendError> {
     let too_large = SendError::MessageTooLarge {
@@ -106,8 +114,8 @@ pub(crate) async fn send_message(
         return Err(too_large);
     }
     let length = u32::try_from(message.len()).map_err(|_| too_large)?;
-    let exchange = async {
-        let (send, mut recv) = conn.open_bi().await.map_err(lost)?;
+    let transfer = async {
+        let (send, recv) = conn.open_bi().await.map_err(lost)?;
         let mut send = GuardedSendStream(Some(send));
         send.write_all(&length.to_be_bytes())
             .await
@@ -115,8 +123,19 @@ pub(crate) async fn send_message(
         send.write_all(message.as_bytes())
             .await
             .map_err(write_failed)?;
-        send.finish().map_err(write_failed)?;
-        // The answer is exactly one byte; anything longer is a protocol violation.
+        let send = send.finish().map_err(write_failed)?;
+        // Resolves once the peer acknowledged every byte, or stopped the stream.
+        match send.stopped().await {
+            Ok(None) => Ok(recv),
+            Ok(Some(code)) => Err(write_failed(WriteError::Stopped(code))),
+            Err(error) => Err(lost(error)),
+        }
+    };
+    let mut recv = time::timeout(transfer_timeout, transfer)
+        .await
+        .unwrap_or(Err(SendError::Timeout))?;
+    // The answer is exactly one byte; anything longer is a protocol violation.
+    let answer = async {
         let status = recv.read_to_end(1).await.map_err(|error| match error {
             ReadToEndError::TooLong => SendError::Rejected,
             ReadToEndError::Read(error) => lost(error),
@@ -128,7 +147,7 @@ pub(crate) async fn send_message(
             _ => Err(SendError::ConnectionLost("no confirmation".to_owned())),
         }
     };
-    time::timeout(ack_timeout, exchange)
+    time::timeout(ack_timeout, answer)
         .await
         .unwrap_or(Err(SendError::Timeout))
 }
@@ -323,7 +342,13 @@ mod tests {
     async fn a_complete_message_is_delivered_and_confirmed() {
         let (_relay, _server, _client, client_conn, server_conn) = connected().await;
         let (sent, read) = tokio::join!(
-            send_message(&client_conn, "{\"ok\":true}", 1024, Duration::from_secs(5)),
+            send_message(
+                &client_conn,
+                "{\"ok\":true}",
+                1024,
+                Duration::from_secs(5),
+                Duration::from_secs(5)
+            ),
             async {
                 match read_one(&server_conn).await {
                     Ok(Incoming::Message(message, answer)) => {

@@ -527,3 +527,67 @@ async fn with_public_relays_the_wallet_finds_the_connector_through_address_looku
     assert!(snapshot.public_relays, "{snapshot}");
     assert!(snapshot.to_string().contains(", public)"), "{snapshot}");
 }
+
+#[test]
+fn the_wallet_is_admitted_through_the_relay_even_when_the_pool_is_full() {
+    let link = password(21);
+    let wallet = link.endpoint_id(Role::Wallet);
+    let stranger = password(22).endpoint_id(Role::Wallet);
+    let relay = |endpoint_id| IncomingAddr::Relay {
+        url: "https://relay.example.com".parse().unwrap(),
+        endpoint_id,
+    };
+    let direct = IncomingAddr::Ip("192.0.2.7:4433".parse().unwrap());
+    let full = MAX_PENDING_HANDSHAKES;
+
+    // The link's wallet is never kept out by attempts that fill the pool.
+    assert_eq!(
+        admission(&relay(wallet), true, wallet, full),
+        Admission::Handshake
+    );
+    // Strangers via the relay never get handshake work.
+    assert_eq!(
+        admission(&relay(stranger), true, wallet, 0),
+        Admission::Ignore
+    );
+    // Direct attempts prove their source address first, then share the bounded pool.
+    assert_eq!(
+        admission(&direct, false, wallet, 0),
+        Admission::ValidateAddress
+    );
+    assert_eq!(admission(&direct, true, wallet, 0), Admission::Handshake);
+    assert_eq!(admission(&direct, true, wallet, full), Admission::Ignore);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_large_message_is_not_cut_short_by_the_confirmation_timeout() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(23);
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    // The confirmation timeout is far shorter than the transfer takes through the relay:
+    // it must only start once every byte reached the peer.
+    let wallet_config = config(&relay_url).with_ack_timeout(Duration::from_millis(20));
+    let wallet = Session::start(&link, Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+
+    let large = "x".repeat(6 * 1024 * 1024);
+    deliver(&wallet, &connector, &large).await.unwrap();
+}
+
+#[test]
+fn a_replaced_wallet_waits_the_longest_before_redialing() {
+    let config = config(&"https://relay.example.com".parse().unwrap());
+    assert_eq!(
+        delay_after_connection(true, &config),
+        config.max_reconnect_delay
+    );
+    assert_eq!(
+        delay_after_connection(false, &config),
+        config.min_reconnect_delay
+    );
+}

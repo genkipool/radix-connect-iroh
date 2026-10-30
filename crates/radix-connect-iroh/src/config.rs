@@ -20,7 +20,7 @@ pub enum Relays {
 
 /// The URLs of n0's public relays used by [`Relays::Public`], for display.
 pub fn public_relay_urls() -> Vec<RelayUrl> {
-    iroh::defaults::prod::default_relay_map().urls()
+    iroh::endpoint::default_relay_mode().relay_map().urls()
 }
 
 /// How long a sender waits for the peer to confirm a message. Same value as the
