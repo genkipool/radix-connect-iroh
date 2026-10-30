@@ -170,8 +170,10 @@ so a host that cannot keep up makes the peer's sends time out instead of growing
 States: `connecting` (wallet dialing), `connected`, `disconnected`.
 
 - The wallet dials, serves the connection until it ends (reporting `connecting` at
-  once), waits 0.5 s doubling up to 15 s, and dials again. A dial attempt is abandoned
-  after 20 s. `networkChanged()` (called by the host on connectivity changes) cuts the
+  once), waits 0.5 s doubling up to 5 s, and dials again. A dial attempt is abandoned
+  after 10 s; one in progress also completes when the connector comes online meanwhile.
+  Since only the wallet dials, a connector that comes online waits at most about 15 s
+  for it (one attempt plus one delay), usually a few seconds. `networkChanged()` (called by the host on connectivity changes) cuts the
   wait short when the change happens while the wallet waits or dials; changes made
   while connected are handled by iroh within the connection and do not count later.
 - States are reported as their latest value: a host that reads late gets the current

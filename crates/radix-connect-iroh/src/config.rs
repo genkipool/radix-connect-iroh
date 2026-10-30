@@ -36,12 +36,16 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// the peer opened its stream. It keeps a stalled stream from blocking the link.
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// First and maximum delay between two dial attempts of the wallet.
+/// First and maximum delay between two dial attempts of the wallet. Only the wallet
+/// dials, so these bound how long a connector that comes online (a browser started, a
+/// server's session reopened) waits for the wallet: at most one attempt plus one delay.
 const DEFAULT_MIN_RECONNECT_DELAY: Duration = Duration::from_millis(500);
-const DEFAULT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
+const DEFAULT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
-/// How long a single dial attempt may take, including the QUIC handshake.
-const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long a single dial attempt may take, including the address lookup and the QUIC
+/// handshake (1–2 s in practice, even over a mobile network). An attempt in progress
+/// also completes when the connector comes online meanwhile.
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Settings of a [`Session`](crate::Session). Both ends of a link must use the same
 /// [`Relays`].
