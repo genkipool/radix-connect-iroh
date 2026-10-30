@@ -28,8 +28,11 @@ pub struct Diagnostics {
     pub local_id: EndpointId,
     /// The peer's endpoint id.
     pub peer_id: EndpointId,
-    /// The relay both ends must use.
-    pub relay_url: RelayUrl,
+    /// The relay this end uses: the configured one, or the public relay it connected
+    /// to (`None` while it has none yet).
+    pub relay_url: Option<RelayUrl>,
+    /// Whether this end uses n0's public relays (rather than a custom one).
+    pub public_relays: bool,
     /// Whether this end is connected to the relay right now (or talks to the peer
     /// through it). While it is not, the peer cannot reach it.
     pub relay_connected: bool,
@@ -84,7 +87,11 @@ impl fmt::Display for Diagnostics {
         } else {
             "NOT connected"
         };
-        write!(f, " relay={} ({relay_state})", self.relay_url)?;
+        let kind = if self.public_relays { ", public" } else { "" };
+        match &self.relay_url {
+            Some(url) => write!(f, " relay={url} ({relay_state}{kind})")?,
+            None => write!(f, " relay=none yet ({relay_state}{kind})")?,
+        }
         if let Some(error) = &self.relay_error {
             write!(f, " relay_error=\"{error}\"")?;
         }
@@ -154,7 +161,8 @@ mod tests {
             role: Role::Wallet,
             local_id: password.endpoint_id(Role::Wallet),
             peer_id: password.endpoint_id(Role::Connector),
-            relay_url: "https://relay.example.com".parse().unwrap(),
+            relay_url: Some("https://relay.example.com".parse().unwrap()),
+            public_relays: false,
             relay_connected: true,
             relay_error: None,
             state: ConnectionState::Connected,

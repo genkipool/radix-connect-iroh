@@ -14,18 +14,20 @@ trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$WORK"' EXIT
 "$ROOT/scripts/build-wasm.sh" nodejs >/dev/null
 cargo build --manifest-path "$ROOT/Cargo.toml" --locked -p radix-connect-iroh --example peer 2>/dev/null
 
-# RELAY_URL=https://... runs the test through a public relay instead of a local one.
+# RELAY_URL=https://... runs the test through that relay instead of a local one;
+# RELAY_URL=public uses n0's public relays with address lookup (no URL at all).
 if [[ "$RELAY_URL" == "http://localhost:3340" ]]; then
     iroh-relay --dev >"$WORK/relay.log" 2>&1 &
     for _ in $(seq 50); do curl -s -o /dev/null "$RELAY_URL" && break; sleep 0.1; done
 fi
 
-node "$ROOT/js/test/e2e-connector.mjs" "$RELAY_URL" >"$WORK/connector.out" 2>"$WORK/connector.err" &
+RELAY_ARG="$RELAY_URL"; [[ "$RELAY_URL" == "public" ]] && RELAY_ARG=""
+node "$ROOT/js/test/e2e-connector.mjs" $RELAY_ARG >"$WORK/connector.out" 2>"$WORK/connector.err" &
 CONNECTOR=$!
 sleep 1
 
 # The wallet sends one request once connected and prints the answer.
-coproc WALLET { "$ROOT/target/debug/examples/peer" wallet "$RELAY_URL" 2>"$WORK/wallet.err"; }
+coproc WALLET { "$ROOT/target/debug/examples/peer" wallet $RELAY_ARG 2>"$WORK/wallet.err"; }
 while read -r -t 30 line <&"${WALLET[0]}"; do
     echo "wallet: $line"
     case "$line" in

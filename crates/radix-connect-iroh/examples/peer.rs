@@ -12,9 +12,7 @@
 
 use std::process::ExitCode;
 
-use radix_connect_iroh::{
-    ConnectionPassword, DEFAULT_RELAY_URL, Role, Session, SessionConfig, SessionEvent,
-};
+use radix_connect_iroh::{ConnectionPassword, Role, Session, SessionConfig, SessionEvent};
 use tokio::io::{AsyncBufReadExt, BufReader};
 
 #[tokio::main]
@@ -38,11 +36,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     };
     let password =
         ConnectionPassword::from_hex(&std::env::var("RADIX_CONNECT_PASSWORD").map_err(|_| usage)?)?;
-    let relay_url = args.next().unwrap_or_else(|| DEFAULT_RELAY_URL.to_owned());
+    // No relay argument: n0's public relays, as the wallet and the extension default to.
+    let relay_url = args.next();
 
-    let session = Session::start(&password, role, SessionConfig::new(&relay_url)?).await?;
+    let config = SessionConfig::for_relay(relay_url.as_deref())?;
+    let session = Session::start(&password, role, config).await?;
+    let relays = relay_url.as_deref().unwrap_or("n0's public relays");
     eprintln!(
-        "{role:?} {} -> peer {} via {relay_url}",
+        "{role:?} {} -> peer {} via {relays}",
         session.local_id(),
         session.peer_id()
     );

@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::RelayUrl;
@@ -481,4 +482,48 @@ async fn diagnostics_count_failed_attempts() {
         snapshot.to_string().contains("failed_attempts="),
         "{snapshot}"
     );
+}
+
+/// [`Relays::Public`] against local stand-ins for n0's relays and address lookup.
+fn public(relay_url: &RelayUrl, lookup: &Arc<iroh::test_utils::DnsPkarrServer>) -> SessionConfig {
+    let mut config = SessionConfig::public();
+    config.insecure_skip_relay_cert_verify = true;
+    config.min_reconnect_delay = Duration::from_millis(50);
+    config.max_reconnect_delay = Duration::from_millis(500);
+    config.test_public_infrastructure = Some(crate::config::TestPublicInfrastructure {
+        relay_url: relay_url.clone(),
+        lookup: lookup.clone(),
+    });
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn with_public_relays_the_wallet_finds_the_connector_through_address_lookup() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let lookup = Arc::new(iroh::test_utils::DnsPkarrServer::run().await.unwrap());
+    let link = password(20);
+
+    let mut connector_config = public(&relay_url, &lookup);
+    connector_config.relay_only = true;
+    let connector = Session::start(&link, Role::Connector, connector_config)
+        .await
+        .unwrap();
+    // The connector announces where it can be reached...
+    lookup
+        .on_endpoint(&connector.local_id(), WAIT)
+        .await
+        .unwrap();
+    // ...and the wallet, configured with no relay URL at all, finds it.
+    let wallet = Session::start(&link, Role::Wallet, public(&relay_url, &lookup))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    deliver(&connector, &wallet, "{\"via\":\"public\"}")
+        .await
+        .unwrap();
+
+    let snapshot = wallet.diagnostics();
+    assert!(snapshot.public_relays, "{snapshot}");
+    assert!(snapshot.to_string().contains(", public)"), "{snapshot}");
 }

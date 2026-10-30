@@ -29,7 +29,7 @@ sealed class IrohSessionEvent {
     data class Message(val message: String) : IrohSessionEvent()
 }
 data class IrohSessionConfig(
-    var relayUrl: String,
+    var relayUrl: String? = null,             // null = n0's public relays (default)
     var ackTimeoutMs: ULong = 10_000uL,
     var maxMessageSize: ULong = 8_388_608uL,
 )
@@ -52,7 +52,7 @@ class IrohSession : AutoCloseable {          // close() frees the native object
     suspend fun shutdown()                    // tells the peer, idempotent; then close()
 }
 
-fun irohDefaultRelayUrl(): String
+fun irohPublicRelayUrls(): List<String>  // for display
 fun irohEndpointId(password: ByteArray, role: IrohRole): String
 fun irohValidateRelayUrl(relayUrl: String): String? // null when usable, else the reason
 
@@ -72,7 +72,7 @@ object RadixConnectIrohAndroid {
 `script-src 'self' 'wasm-unsafe-eval'` in the manifest CSP.
 
 ```ts
-import init, { IrohSession, defaultRelayUrl, endpointId, setLogger } from '@radixdlt/radix-connect-iroh'
+import init, { IrohSession, publicRelayUrls, endpointId, setLogger } from '@radixdlt/radix-connect-iroh'
 import wasmUrl from '@radixdlt/radix-connect-iroh/radix_connect_iroh_bg.wasm?url'
 
 await init({ module_or_path: wasmUrl }) // once per page
@@ -88,7 +88,8 @@ type IrohErrorCode =
 // Rejections are `Error` objects with an extra `code: IrohErrorCode` property.
 
 class IrohSession {
-  static start(password: Uint8Array, role: IrohRole, relayUrl: string, ackTimeoutMs?: number): Promise<IrohSession>
+  // relayUrl undefined/null = n0's public relays (default)
+  static start(password: Uint8Array, role: IrohRole, relayUrl?: string | null, ackTimeoutMs?: number | null): Promise<IrohSession>
   localEndpointId(): string
   peerEndpointId(): string
   state(): IrohConnectionState
@@ -98,7 +99,7 @@ class IrohSession {
   shutdown(): Promise<void>
   free(): void
 }
-function defaultRelayUrl(): string
+function publicRelayUrls(): string[] // for display
 function endpointId(password: Uint8Array, role: IrohRole): string
 function validateRelayUrl(relayUrl: string): string | undefined // undefined when usable
 function setLogger(logger: (level: string, target: string, message: string) => void, maxLevel: 'error' | 'warn' | 'info' | 'debug' | 'trace'): void
@@ -107,7 +108,8 @@ function setLogger(logger: (level: string, target: string, message: string) => v
 ## Diagnostics
 
 `diagnostics()` returns a snapshot that holds no secrets: role, both endpoint ids, the
-relay URL, whether this end is connected to the relay (and the relay's last error),
+relay in use (the custom one, or the public relay this end connected to) and whether
+the public relays are used, whether this end is connected to the relay (and the relay's last error),
 the connection state, the path (direct or relay) and its RTT while connected, failed
 attempts since the last connection, the last error (dialing, handshake, why a
 connection ended, a failed send...) and how long the connection has been up, plus a

@@ -21,7 +21,8 @@
 //! let password = ConnectionPassword::from_hex(
 //!     "cafecafecafecafecafecafecafecafecafecafecafecafecafecafecafecafe",
 //! )?;
-//! let config = SessionConfig::new(radix_connect_iroh::DEFAULT_RELAY_URL)?;
+//! // n0's public relays; `SessionConfig::new(url)` for a self-hosted one.
+//! let config = SessionConfig::public();
 //! let session = Session::start(&password, Role::Wallet, config).await?;
 //! while let Some(event) = session.next_event().await {
 //!     if let SessionEvent::Message(json) = event {
@@ -51,7 +52,9 @@ pub mod logging;
 mod protocol;
 mod session;
 
-pub use config::{DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_RELAY_URL, SessionConfig};
+pub use config::{
+    DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, Relays, SessionConfig, public_relay_urls,
+};
 pub use diagnostics::{Diagnostics, PathKind};
 pub use error::{Error, SendError};
 pub use iroh::EndpointId;

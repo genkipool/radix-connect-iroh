@@ -44,7 +44,10 @@ export type IrohDiagnostics = {
   role: IrohRole
   localEndpointId: string
   peerEndpointId: string
-  relayUrl: string
+  /** The custom relay, or the public relay this end connected to. */
+  relayUrl?: string
+  /** Whether this end uses n0's public relays. */
+  publicRelays: boolean
   /** Without the relay the peer cannot reach this end. */
   relayConnected: boolean
   relayError?: string
@@ -139,7 +142,10 @@ fn diagnostics_to_js(diagnostics: core::Diagnostics) -> JsValue {
     );
     set("localEndpointId", diagnostics.local_id.to_string().into());
     set("peerEndpointId", diagnostics.peer_id.to_string().into());
-    set("relayUrl", diagnostics.relay_url.to_string().into());
+    if let Some(url) = diagnostics.relay_url {
+        set("relayUrl", url.to_string().into());
+    }
+    set("publicRelays", diagnostics.public_relays.into());
     set("relayConnected", diagnostics.relay_connected.into());
     if let Some(error) = diagnostics.relay_error {
         set("relayError", error.into());
@@ -181,17 +187,20 @@ pub struct IrohSession {
 
 #[wasm_bindgen]
 impl IrohSession {
-    /// Starts the `role` end of the link secured by `password` (32 bytes), using the
-    /// relay at `relayUrl`. Connecting happens in the background (see `nextEvent`).
+    /// Starts the `role` end of the link secured by `password` (32 bytes). With no
+    /// `relayUrl` it uses n0's public relays (the default); otherwise that custom relay.
+    /// Both ends of a link must make the same choice. Connecting happens in the
+    /// background (see `nextEvent`).
     pub async fn start(
         password: Vec<u8>,
         #[wasm_bindgen(unchecked_param_type = "IrohRole")] role: String,
-        #[wasm_bindgen(js_name = relayUrl)] relay_url: String,
+        #[wasm_bindgen(js_name = relayUrl)] relay_url: Option<String>,
         #[wasm_bindgen(js_name = ackTimeoutMs)] ack_timeout_ms: Option<u32>,
     ) -> Result<IrohSession, JsValue> {
         let password = password_from(password)?;
         let role = role_from(&role)?;
-        let mut config = core::SessionConfig::new(&relay_url).map_err(error_from)?;
+        let mut config =
+            core::SessionConfig::for_relay(relay_url.as_deref()).map_err(error_from)?;
         if let Some(ack_timeout_ms) = ack_timeout_ms {
             config = config.with_ack_timeout(Duration::from_millis(ack_timeout_ms.into()));
         }
@@ -276,10 +285,13 @@ impl Drop for IrohSession {
     }
 }
 
-/// The relay used when none is configured (n0's public EU relay, for development).
-#[wasm_bindgen(js_name = defaultRelayUrl)]
-pub fn default_relay_url() -> String {
-    core::DEFAULT_RELAY_URL.to_owned()
+/// The URLs of n0's public relays, used when no custom relay is configured (for display).
+#[wasm_bindgen(js_name = publicRelayUrls)]
+pub fn public_relay_urls() -> Vec<String> {
+    core::public_relay_urls()
+        .into_iter()
+        .map(|url| url.to_string())
+        .collect()
 }
 
 /// Hex endpoint id of the `role` end of the link secured by `password`.

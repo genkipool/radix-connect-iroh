@@ -2,12 +2,16 @@ use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+use iroh::address_lookup::DnsAddressLookup;
+use iroh::address_lookup::{AddrFilter, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{Connection, IncomingAddr, QuicTransportConfig, presets};
 use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, Watcher};
 use n0_future::task::{self, AbortOnDropHandle};
 use n0_future::{FuturesUnordered, StreamExt, time};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
+use crate::config::Relays;
 use crate::diagnostics::{self, Diagnostics};
 use crate::guard::PeerGuard;
 use crate::protocol::{self, ALPN, CloseCode, Incoming};
@@ -133,24 +137,12 @@ impl Session {
             Role::Connector => vec![ALPN.to_vec()],
             Role::Wallet => Vec::new(),
         };
-        // `Minimal` has no address lookup: the endpoint publishes nothing about itself
-        // (no DNS / pkarr records) and is found only through the configured relay.
-        #[allow(unused_mut)]
-        let mut builder = Endpoint::builder(presets::Minimal)
+        let builder = Endpoint::builder(presets::Minimal)
             .secret_key(password.secret_key(role))
             .alpns(alpns)
-            .relay_mode(RelayMode::custom([config.relay_url.clone()]))
             .transport_config(transport)
             .hooks(PeerGuard::new(peer));
-        #[cfg(test)]
-        {
-            if config.insecure_skip_relay_cert_verify {
-                builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
-            }
-            if config.relay_only {
-                builder = builder.clear_ip_transports();
-            }
-        }
+        let builder = with_relays(builder, &config, role);
         let endpoint = time::timeout(BIND_TIMEOUT, builder.bind())
             .await
             .map_err(|_| Error::Bind("timed out".to_owned()))?
@@ -178,7 +170,7 @@ impl Session {
             role = ?role,
             local = %shared.endpoint.id().fmt_short(),
             peer = %peer.fmt_short(),
-            relay = %shared.config.relay_url,
+            relays = ?shared.config.relays,
             "radix connect iroh session started"
         );
         let driver = AbortOnDropHandle::new(task::spawn(drive(shared.clone())));
@@ -248,6 +240,15 @@ impl Session {
             .borrow()
             .as_ref()
             .map_or((None, None), diagnostics::selected_path);
+        let relay_url = match &shared.config.relays {
+            Relays::Custom(url) => Some(url.clone()),
+            // The public relay this end ended up with, once it has one.
+            Relays::Public => relays
+                .iter()
+                .find(|relay| relay.is_connected())
+                .or(relays.first())
+                .map(|relay| relay.url().clone()),
+        };
         // iroh reports its home relay a little after a connection already travels
         // through the relay: talking to the peer through it counts as connected.
         let relay_connected = relays.iter().any(|relay| relay.is_connected())
@@ -260,7 +261,8 @@ impl Session {
             role: shared.role,
             local_id: shared.endpoint.id(),
             peer_id: shared.peer,
-            relay_url: shared.config.relay_url.clone(),
+            relay_url,
+            public_relays: shared.config.relays == Relays::Public,
             relay_connected,
             relay_error,
             state: *shared.state.borrow(),
@@ -398,6 +400,58 @@ impl Shared {
     }
 }
 
+/// Applies the relay choice. `Minimal` has no address lookup of its own: with a custom
+/// relay the endpoint publishes nothing about itself and is found only through that
+/// relay; with the public relays the connector publishes its relay URL (never its IP
+/// addresses) and the wallet looks it up.
+fn with_relays(
+    builder: iroh::endpoint::Builder,
+    config: &SessionConfig,
+    role: Role,
+) -> iroh::endpoint::Builder {
+    #[cfg(test)]
+    let builder = test_builder(builder, config);
+    match &config.relays {
+        Relays::Custom(url) => builder.relay_mode(RelayMode::custom([url.clone()])),
+        Relays::Public => {
+            #[cfg(test)]
+            if let Some(test) = &config.test_public_infrastructure {
+                return builder
+                    .relay_mode(RelayMode::custom([test.relay_url.clone()]))
+                    .preset(test.lookup.preset());
+            }
+            let builder = builder.relay_mode(RelayMode::Default);
+            match role {
+                Role::Connector => builder
+                    .addr_filter(AddrFilter::relay_only())
+                    .address_lookup(PkarrPublisher::n0_dns()),
+                Role::Wallet => {
+                    let builder = builder.address_lookup(PkarrResolver::n0_dns());
+                    // Browsers cannot query DNS; elsewhere it is a second, independent
+                    // way to find the connector.
+                    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+                    let builder = builder.address_lookup(DnsAddressLookup::n0_dns());
+                    builder
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+fn test_builder(
+    mut builder: iroh::endpoint::Builder,
+    config: &SessionConfig,
+) -> iroh::endpoint::Builder {
+    if config.insecure_skip_relay_cert_verify {
+        builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
+    }
+    if config.relay_only {
+        builder = builder.clear_ip_transports();
+    }
+    builder
+}
+
 async fn drive(shared: Arc<Shared>) {
     let run = async {
         match shared.role {
@@ -422,7 +476,11 @@ async fn drive(shared: Arc<Shared>) {
 /// Wallet: keep dialing the Connector Extension, and serve each connection until it
 /// ends.
 async fn dial(shared: &Arc<Shared>) {
-    let peer_addr = EndpointAddr::new(shared.peer).with_relay_url(shared.config.relay_url.clone());
+    // With the public relays the connector's relay is found through address lookup.
+    let peer_addr = match &shared.config.relays {
+        Relays::Public => EndpointAddr::new(shared.peer),
+        Relays::Custom(url) => EndpointAddr::new(shared.peer).with_relay_url(url.clone()),
+    };
     let mut delay = shared.config.min_reconnect_delay;
     loop {
         shared.set_state(ConnectionState::Connecting).await;
@@ -480,10 +538,15 @@ async fn log_relay_status(shared: &Shared) {
         let error = statuses
             .iter()
             .find_map(|relay| relay.last_error().map(|error| error.to_string()));
+        let relay = statuses
+            .iter()
+            .find(|relay| relay.is_connected())
+            .or(statuses.first())
+            .map_or_else(|| "none".to_owned(), |relay| relay.url().to_string());
         if connected && !was_connected {
-            tracing::info!(relay = %shared.config.relay_url, "connected to the relay");
+            tracing::info!(%relay, "connected to the relay");
         } else if !connected && (was_connected || error.is_some()) {
-            tracing::warn!(relay = %shared.config.relay_url, error = error.as_deref().unwrap_or("none"), "not connected to the relay: the peer cannot reach this end");
+            tracing::warn!(%relay, error = error.as_deref().unwrap_or("none"), "not connected to the relay: the peer cannot reach this end");
         }
         was_connected = connected;
     }

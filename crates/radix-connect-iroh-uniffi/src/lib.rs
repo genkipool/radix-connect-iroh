@@ -139,8 +139,11 @@ pub struct IrohDiagnostics {
     pub local_endpoint_id: String,
     /// Hex id of the peer.
     pub peer_endpoint_id: String,
-    /// The relay both ends must use.
-    pub relay_url: String,
+    /// The relay this end uses: the custom one, or the public relay it connected to
+    /// (`None` while it has none yet).
+    pub relay_url: Option<String>,
+    /// Whether this end uses n0's public relays.
+    pub public_relays: bool,
     /// Whether this end is connected to the relay (without it the peer cannot reach it).
     pub relay_connected: bool,
     /// The last error talking to the relay.
@@ -173,7 +176,8 @@ impl From<core::Diagnostics> for IrohDiagnostics {
             },
             local_endpoint_id: diagnostics.local_id.to_string(),
             peer_endpoint_id: diagnostics.peer_id.to_string(),
-            relay_url: diagnostics.relay_url.to_string(),
+            relay_url: diagnostics.relay_url.map(|url| url.to_string()),
+            public_relays: diagnostics.public_relays,
             relay_connected: diagnostics.relay_connected,
             relay_error: diagnostics.relay_error,
             state: diagnostics.state.into(),
@@ -192,8 +196,11 @@ impl From<core::Diagnostics> for IrohDiagnostics {
 /// Settings of a session. Both ends of a link must use the same relay.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct IrohSessionConfig {
-    /// Relay server, e.g. `https://relay.example.com`.
-    pub relay_url: String,
+    /// A custom relay server, e.g. `https://relay.example.com`; `None` (the default)
+    /// uses n0's public relays, closest one, found through address lookup. Both ends
+    /// of a link must make the same choice.
+    #[uniffi(default = None)]
+    pub relay_url: Option<String>,
     /// How long `send` waits for the peer to confirm a message.
     #[uniffi(default = 10000)]
     pub ack_timeout_ms: u64,
@@ -210,7 +217,7 @@ impl TryFrom<IrohSessionConfig> for core::SessionConfig {
             usize::try_from(config.max_message_size).map_err(|_| IrohError::Internal {
                 reason: "max_message_size does not fit this platform".to_owned(),
             })?;
-        Ok(core::SessionConfig::new(&config.relay_url)?
+        Ok(core::SessionConfig::for_relay(config.relay_url.as_deref())?
             .with_ack_timeout(Duration::from_millis(config.ack_timeout_ms))
             .with_max_message_size(max_message_size))
     }
@@ -401,10 +408,13 @@ impl Drop for IrohSession {
     }
 }
 
-/// The relay used when none is configured (n0's public EU relay, for development).
+/// The URLs of n0's public relays, used when no custom relay is configured (for display).
 #[uniffi::export]
-pub fn iroh_default_relay_url() -> String {
-    core::DEFAULT_RELAY_URL.to_owned()
+pub fn iroh_public_relay_urls() -> Vec<String> {
+    core::public_relay_urls()
+        .into_iter()
+        .map(|url| url.to_string())
+        .collect()
 }
 
 /// Hex endpoint id of the `role` end of the link secured by `password`.
@@ -452,20 +462,22 @@ mod tests {
 
     #[test]
     fn validates_relay_urls() {
-        assert_eq!(iroh_validate_relay_url(iroh_default_relay_url()), None);
+        for url in iroh_public_relay_urls() {
+            assert_eq!(iroh_validate_relay_url(url), None);
+        }
         assert!(iroh_validate_relay_url("ftp://example.com".to_owned()).is_some());
     }
 
     #[test]
     fn config_defaults_and_conversion() {
         let config = IrohSessionConfig {
-            relay_url: "https://relay.example.com".to_owned(),
+            relay_url: Some("https://relay.example.com".to_owned()),
             ack_timeout_ms: 1500,
             max_message_size: 1024,
         };
         assert!(core::SessionConfig::try_from(config).is_ok());
         let invalid = IrohSessionConfig {
-            relay_url: "nope".to_owned(),
+            relay_url: Some("nope".to_owned()),
             ack_timeout_ms: 1500,
             max_message_size: 1024,
         };
@@ -482,7 +494,7 @@ mod tests {
             IrohRole::Connector,
             IrohSessionConfig {
                 // Never resolves (RFC 2606): the test stays offline.
-                relay_url: "https://relay.invalid".to_owned(),
+                relay_url: Some("https://relay.invalid".to_owned()),
                 ack_timeout_ms: 1000,
                 max_message_size: 1024,
             },
@@ -492,7 +504,11 @@ mod tests {
         let diagnostics = session.diagnostics();
         assert_eq!(diagnostics.role, IrohRole::Connector);
         assert_eq!(diagnostics.state, IrohConnectionState::Disconnected);
-        assert_eq!(diagnostics.relay_url, "https://relay.invalid/");
+        assert_eq!(
+            diagnostics.relay_url.as_deref(),
+            Some("https://relay.invalid/")
+        );
+        assert!(!diagnostics.public_relays);
         assert!(diagnostics.summary.starts_with("connector "));
         assert_eq!(
             n0_future::future::block_on(session.send("{}".to_owned())),

@@ -4,12 +4,24 @@ use iroh::RelayUrl;
 
 use crate::Error;
 
-/// Relay used when the host application has no relay configured: n0's public EU relay.
-///
-/// Public n0 relays are meant for development and moderate use. A production
-/// deployment should run its own `iroh-relay` (see the README), just as Radix runs its
-/// own WebRTC signaling and TURN servers, and configure it on both sides of the link.
-pub const DEFAULT_RELAY_URL: &str = "https://euc1-1.relay.n0.iroh.link./";
+/// Which relay servers a session uses. Both ends of a link must use the same choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Relays {
+    /// n0's public relays (North America east and west, Europe, Asia-Pacific). Each end
+    /// connects to its closest one and moves to another if it fails; the Connector
+    /// Extension publishes which one it uses — the relay URL only, never an IP
+    /// address — through n0's address lookup (pkarr/DNS), where the wallet finds it.
+    /// Nothing to host or configure. The default.
+    Public,
+    /// One relay both ends are configured with, e.g. a self-hosted `iroh-relay`. Nothing
+    /// is published anywhere.
+    Custom(RelayUrl),
+}
+
+/// The URLs of n0's public relays used by [`Relays::Public`], for display.
+pub fn public_relay_urls() -> Vec<RelayUrl> {
+    iroh::defaults::prod::default_relay_map().urls()
+}
 
 /// How long a sender waits for the peer to confirm a message. Same value as the
 /// WebRTC transport's `receiveMessageConfirmation` timeout.
@@ -32,10 +44,10 @@ const DEFAULT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(15);
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Settings of a [`Session`](crate::Session). Both ends of a link must use the same
-/// relay server.
+/// [`Relays`].
 #[derive(Debug, Clone)]
 pub struct SessionConfig {
-    pub(crate) relay_url: RelayUrl,
+    pub(crate) relays: Relays,
     pub(crate) ack_timeout: Duration,
     pub(crate) max_message_size: usize,
     pub(crate) receive_timeout: Duration,
@@ -48,17 +60,53 @@ pub struct SessionConfig {
     /// Tests use it to reproduce the browser, where only the relay is reachable.
     #[cfg(test)]
     pub(crate) relay_only: bool,
+    /// Tests run [`Relays::Public`] against a local relay and pkarr server.
+    #[cfg(test)]
+    pub(crate) test_public_infrastructure: Option<TestPublicInfrastructure>,
+}
+
+/// Local stand-ins for n0's public relays and address lookup (its test pkarr server
+/// only accepts publishing, so lookups go through its DNS server).
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct TestPublicInfrastructure {
+    pub(crate) relay_url: RelayUrl,
+    pub(crate) lookup: std::sync::Arc<iroh::test_utils::DnsPkarrServer>,
+}
+
+impl Default for SessionConfig {
+    /// [`SessionConfig::public`].
+    fn default() -> Self {
+        Self::public()
+    }
 }
 
 impl SessionConfig {
-    /// Default settings using the relay server at `relay_url`.
+    /// Default settings with n0's public relays ([`Relays::Public`]).
+    pub fn public() -> Self {
+        Self::with_relays(Relays::Public)
+    }
+
+    /// Default settings using the single relay server at `relay_url`
+    /// ([`Relays::Custom`]).
     ///
     /// The URL must be an absolute `https://` URL without credentials. Plain `http://`
     /// is accepted only for loopback, private and link-local hosts (a development relay
     /// on this machine or the local network).
     pub fn new(relay_url: &str) -> Result<Self, Error> {
-        Ok(Self {
-            relay_url: parse_relay_url(relay_url)?,
+        Ok(Self::with_relays(Relays::Custom(parse_relay_url(
+            relay_url,
+        )?)))
+    }
+
+    /// [`SessionConfig::new`] for `Some(url)`, [`SessionConfig::public`] for `None`.
+    pub fn for_relay(relay_url: Option<&str>) -> Result<Self, Error> {
+        relay_url.map_or_else(|| Ok(Self::public()), Self::new)
+    }
+
+    fn with_relays(relays: Relays) -> Self {
+        Self {
+            relays,
             ack_timeout: DEFAULT_ACK_TIMEOUT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             receive_timeout: DEFAULT_RECEIVE_TIMEOUT,
@@ -69,7 +117,9 @@ impl SessionConfig {
             insecure_skip_relay_cert_verify: false,
             #[cfg(test)]
             relay_only: false,
-        })
+            #[cfg(test)]
+            test_public_infrastructure: None,
+        }
     }
 
     /// Overrides how long [`Session::send`](crate::Session::send) waits for the peer
@@ -85,9 +135,9 @@ impl SessionConfig {
         self
     }
 
-    /// The relay server this session uses.
-    pub fn relay_url(&self) -> &RelayUrl {
-        &self.relay_url
+    /// The relays this session uses.
+    pub fn relays(&self) -> &Relays {
+        &self.relays
     }
 }
 
@@ -134,8 +184,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_relay_url_is_valid() {
-        assert!(SessionConfig::new(DEFAULT_RELAY_URL).is_ok());
+    fn public_relays_are_the_default() {
+        assert_eq!(SessionConfig::default().relays(), &Relays::Public);
+        assert_eq!(
+            SessionConfig::for_relay(None).unwrap().relays(),
+            &Relays::Public
+        );
+        assert!(matches!(
+            SessionConfig::for_relay(Some("https://relay.example.com"))
+                .unwrap()
+                .relays(),
+            Relays::Custom(_)
+        ));
+        assert!(SessionConfig::for_relay(Some("ftp://relay.example.com")).is_err());
+    }
+
+    #[test]
+    fn the_public_relays_cover_several_regions() {
+        let urls = public_relay_urls();
+        assert!(urls.len() >= 3, "{urls:?}");
+        assert!(urls.iter().all(|url| url.scheme() == "https"));
     }
 
     #[test]

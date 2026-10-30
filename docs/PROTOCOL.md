@@ -60,16 +60,19 @@ Test vector — `P = cafe…cafe` (the two bytes `ca fe` repeated 16 times):
 - **QUIC with TLS 1.3 and raw public keys** (iroh). Both ends authenticate: the
   handshake proves possession of the secret key behind each `EndpointId`.
 - **ALPN:** `radix-connect/iroh/1`. A new protocol version gets a new ALPN.
-- **Relay:** both sides are configured with the same relay URL, like both sides of a
-  WebRTC link use the same signaling server. The connector keeps a connection to that
-  relay (its "home relay"); the wallet dials `EndpointAddr { id: connector_id, relay:
-  relay_url }`. The relay forwards encrypted QUIC packets and helps the endpoints punch
-  a direct UDP path when possible (never in a browser, which has no UDP).
-- **No address lookup:** endpoints use iroh's `Minimal` preset; they publish no DNS or
-  pkarr records.
-
-Default relay: `https://euc1-1.relay.n0.iroh.link./` (n0's public relay, for
-development). Production deployments are expected to run their own `iroh-relay`.
+- **Relays.** A relay forwards encrypted QUIC packets between the two endpoints and
+  helps them punch a direct UDP path when possible (never in a browser, which has no
+  UDP). Both ends of a link make the same one of two choices:
+  - **Public (default):** n0's public relays (North America east and west, Europe,
+    Asia-Pacific). Each end connects to its closest relay and moves to another if it
+    fails. The connector publishes which relay it uses — the relay URL only, never an
+    IP address — as a signed pkarr record in n0's address lookup (`dns.iroh.link`);
+    the wallet dials the connector's `EndpointId` alone and finds the relay through
+    that lookup (pkarr over HTTPS, and DNS where available). Nothing to host or
+    configure, which is what lets it run in production without a Radix-operated relay.
+  - **Custom:** one relay URL configured on both ends (e.g. a self-hosted
+    `iroh-relay`). The wallet dials `EndpointAddr { id: connector_id, relay: url }`;
+    nothing is published anywhere.
 
 ## 5. Admission
 
@@ -166,11 +169,15 @@ QUIC/TLS 1.3 between the two endpoints; relays and network observers only see
 encrypted packets. TLS 1.3's ephemeral key exchange gives forward secrecy: a later
 leak of `P` does not decrypt recorded sessions.
 
-**What relays learn.** The two endpoint ids of a link, when they are online, and the
-timing and size of encrypted packets. Because ids are derived per link, a relay cannot
-correlate the links of one wallet or one browser. No endpoint publishes anything to a
-discovery service. A malicious relay can drop traffic (denial of service), like a
-signaling or TURN server can today, but cannot read or forge it. Relay TLS certificates
+**What relays and the address lookup learn.** A relay learns the two endpoint ids of a
+link, their IP addresses, when they are online, and the timing and size of encrypted
+packets. With the public relays, n0's address lookup also stores, per connector
+endpoint id, which relay it uses (a signed record that contains no IP address and
+nothing about the user). Because ids are derived per link, neither can correlate the
+links of one wallet or one browser. With a custom relay nothing is published. A malicious relay — or a tampered lookup record, which the
+connector's signature prevents — can drop traffic (denial of service), like a signaling
+or TURN server can today, but cannot read or forge it: the QUIC handshake still
+authenticates the derived endpoint keys. Relay TLS certificates
 are verified against the embedded web PKI roots.
 
 **Domain separation.** The derivation contexts are unique to this protocol and role;

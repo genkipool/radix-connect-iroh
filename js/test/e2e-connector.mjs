@@ -7,8 +7,10 @@ const [relayUrl] = process.argv.slice(2)
 const password = Uint8Array.from(Buffer.from(process.env.RADIX_CONNECT_PASSWORD, 'hex'))
 setLogger((level, target, message) => console.error(`[${level}] ${target}: ${message}`), 'info')
 
-const session = await IrohSession.start(password, 'connector', relayUrl, 10_000)
+// No relay URL: n0's public relays with address lookup.
+const session = await IrohSession.start(password, 'connector', relayUrl ?? null, 10_000)
 console.log(`connector ${session.localEndpointId()} waiting for ${session.peerEndpointId()}`)
+const report = setInterval(() => console.error(`diagnostics: ${session.diagnostics().summary}`), 5_000)
 const timeout = setTimeout(() => {
   console.error('timed out')
   process.exit(2)
@@ -27,5 +29,6 @@ for (;;) {
   }
 }
 clearTimeout(timeout)
+clearInterval(report)
 await session.shutdown()
 session.free()

@@ -51,7 +51,7 @@ extension without the other one:
 
 ```sh
 export RADIX_CONNECT_PASSWORD=<password-hex>          # the link's connection password
-cargo run --example peer -- wallet    [relay-url]   # pretend to be the wallet
+cargo run --example peer -- wallet    [relay-url]   # pretend to be the wallet (no URL: public relays)
 cargo run --example peer -- connector [relay-url]   # pretend to be the extension
 ```
 
@@ -67,9 +67,13 @@ link by hand.
 
 ## Relays
 
-Both ends of a link must use the same relay, as both ends of a WebRTC link use the
-same signaling server. The default is n0's public EU relay, fine for development.
-Production should run its own:
+By default both ends use **n0's public relays**: each end connects to its closest one
+(North America, Europe, Asia-Pacific) and fails over to another, and the wallet finds
+the connector's relay through n0's address lookup, which only ever stores the relay
+URL. Nothing to host or configure, so it works in production without operating a
+relay.
+
+A **custom relay** (e.g. self-hosted) can be configured instead, on both ends:
 
 ```sh
 cargo install iroh-relay --features server --locked
