@@ -30,8 +30,8 @@ pub struct Diagnostics {
     pub peer_id: EndpointId,
     /// The relay both ends must use.
     pub relay_url: RelayUrl,
-    /// Whether this end is connected to the relay right now. While it is not, the
-    /// peer cannot reach it (and a wallet cannot reach the connector).
+    /// Whether this end is connected to the relay right now (or talks to the peer
+    /// through it). While it is not, the peer cannot reach it.
     pub relay_connected: bool,
     /// The last error talking to the relay, if any.
     pub relay_error: Option<String>,

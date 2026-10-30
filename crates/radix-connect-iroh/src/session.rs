@@ -243,15 +243,18 @@ impl Session {
     pub fn diagnostics(&self) -> Diagnostics {
         let shared = &self.shared;
         let relays = shared.endpoint.home_relay_status().get();
-        let relay_connected = relays.iter().any(|relay| relay.is_connected());
-        let relay_error = relays
-            .iter()
-            .find_map(|relay| relay.last_error().map(|error| error.to_string()));
         let (path, rtt) = shared
             .connection
             .borrow()
             .as_ref()
             .map_or((None, None), diagnostics::selected_path);
+        // iroh reports its home relay a little after a connection already travels
+        // through the relay: talking to the peer through it counts as connected.
+        let relay_connected = relays.iter().any(|relay| relay.is_connected())
+            || path == Some(diagnostics::PathKind::Relay);
+        let relay_error = relays
+            .iter()
+            .find_map(|relay| relay.last_error().map(|error| error.to_string()));
         let trouble = shared.trouble();
         Diagnostics {
             role: shared.role,
