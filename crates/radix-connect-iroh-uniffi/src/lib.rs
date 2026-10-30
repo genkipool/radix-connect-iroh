@@ -120,6 +120,75 @@ impl From<core::SessionEvent> for IrohSessionEvent {
     }
 }
 
+/// How the connection to the peer currently travels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum IrohPathKind {
+    /// Directly between the two devices.
+    Direct,
+    /// Through the relay server.
+    Relay,
+}
+
+/// A snapshot of a session's connectivity for logs and diagnostics screens. It holds
+/// no secrets (endpoint ids are public keys; errors never include message contents).
+#[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
+pub struct IrohDiagnostics {
+    /// Which end of the link this session is.
+    pub role: IrohRole,
+    /// Hex id of this end.
+    pub local_endpoint_id: String,
+    /// Hex id of the peer.
+    pub peer_endpoint_id: String,
+    /// The relay both ends must use.
+    pub relay_url: String,
+    /// Whether this end is connected to the relay (without it the peer cannot reach it).
+    pub relay_connected: bool,
+    /// The last error talking to the relay.
+    pub relay_error: Option<String>,
+    /// State of the connection to the peer.
+    pub state: IrohConnectionState,
+    /// How the connection travels, while connected.
+    pub path: Option<IrohPathKind>,
+    /// Round-trip time of the selected path, while connected.
+    pub rtt_ms: Option<u64>,
+    /// Failed attempts to reach the peer since the last connection.
+    pub failed_attempts: u32,
+    /// The last thing that went wrong.
+    pub last_error: Option<String>,
+    /// How long the current connection has been up.
+    pub connected_for_ms: Option<u64>,
+    /// All of the above in one line, ready for a log.
+    pub summary: String,
+}
+
+impl From<core::Diagnostics> for IrohDiagnostics {
+    fn from(diagnostics: core::Diagnostics) -> Self {
+        let millis =
+            |duration: std::time::Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+        Self {
+            summary: diagnostics.to_string(),
+            role: match diagnostics.role {
+                core::Role::Wallet => IrohRole::Wallet,
+                core::Role::Connector => IrohRole::Connector,
+            },
+            local_endpoint_id: diagnostics.local_id.to_string(),
+            peer_endpoint_id: diagnostics.peer_id.to_string(),
+            relay_url: diagnostics.relay_url.to_string(),
+            relay_connected: diagnostics.relay_connected,
+            relay_error: diagnostics.relay_error,
+            state: diagnostics.state.into(),
+            path: diagnostics.path.map(|path| match path {
+                core::PathKind::Direct => IrohPathKind::Direct,
+                core::PathKind::Relay => IrohPathKind::Relay,
+            }),
+            rtt_ms: diagnostics.rtt.map(millis),
+            failed_attempts: diagnostics.failed_attempts,
+            last_error: diagnostics.last_error,
+            connected_for_ms: diagnostics.connected_for.map(millis),
+        }
+    }
+}
+
 /// Settings of a session. Both ends of a link must use the same relay.
 #[derive(Debug, Clone, PartialEq, Eq, uniffi::Record)]
 pub struct IrohSessionConfig {
@@ -278,6 +347,11 @@ impl IrohSession {
         self.session.state().into()
     }
 
+    /// A snapshot of the connectivity, for logs and diagnostics screens. Cheap.
+    pub fn diagnostics(&self) -> IrohDiagnostics {
+        self.session.diagnostics().into()
+    }
+
     /// Sends one message and waits until the peer confirms it. Fails at once with
     /// `NotConnected` when there is no connection.
     pub async fn send(&self, message: String) -> Result<(), IrohError> {
@@ -415,6 +489,11 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(session.state(), IrohConnectionState::Disconnected);
+        let diagnostics = session.diagnostics();
+        assert_eq!(diagnostics.role, IrohRole::Connector);
+        assert_eq!(diagnostics.state, IrohConnectionState::Disconnected);
+        assert_eq!(diagnostics.relay_url, "https://relay.invalid/");
+        assert!(diagnostics.summary.starts_with("connector "));
         assert_eq!(
             n0_future::future::block_on(session.send("{}".to_owned())),
             Err(IrohError::NotConnected)

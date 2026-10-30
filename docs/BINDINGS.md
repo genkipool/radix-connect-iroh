@@ -45,6 +45,7 @@ class IrohSession : AutoCloseable {          // close() frees the native object
     fun localEndpointId(): String
     fun peerEndpointId(): String
     fun state(): IrohConnectionState
+    fun diagnostics(): IrohDiagnostics        // connectivity snapshot; `summary` is one log line
     suspend fun send(message: String)         // throws IrohException; NotConnected immediately
     suspend fun nextEvent(): IrohSessionEvent? // null once shut down; taking a Message confirms it to the peer
     suspend fun networkChanged()              // call from ConnectivityManager callbacks
@@ -91,6 +92,7 @@ class IrohSession {
   localEndpointId(): string
   peerEndpointId(): string
   state(): IrohConnectionState
+  diagnostics(): IrohDiagnostics // connectivity snapshot; `summary` is one log line
   send(message: string): Promise<void>
   nextEvent(): Promise<IrohSessionEvent | undefined> // undefined once shut down; taking a message confirms it
   shutdown(): Promise<void>
@@ -101,3 +103,28 @@ function endpointId(password: Uint8Array, role: IrohRole): string
 function validateRelayUrl(relayUrl: string): string | undefined // undefined when usable
 function setLogger(logger: (level: string, target: string, message: string) => void, maxLevel: 'error' | 'warn' | 'info' | 'debug' | 'trace'): void
 ```
+
+## Diagnostics
+
+`diagnostics()` returns a snapshot that holds no secrets: role, both endpoint ids, the
+relay URL, whether this end is connected to the relay (and the relay's last error),
+the connection state, the path (direct or relay) and its RTT while connected, failed
+attempts since the last connection, the last error (dialing, handshake, why a
+connection ended, a failed send...) and how long the connection has been up, plus a
+one-line `summary`. Hosts should log the summary on every state change and on send
+failures, and show the fields on their debug/diagnostics screens.
+
+The library's own logs (routed with `irohInstallLogSink` / `setLogger`) explain the
+same events as they happen, e.g. "not connected to the relay: the peer cannot reach
+this end", "dialing the connector timed out: is it running, with iroh, on the same
+relay?", "connection to the peer ended reason=replaced by a newer connection".
+
+### Reading a snapshot
+
+| What you see | What it usually means |
+|---|---|
+| `relay … (NOT connected)` | No internet, the relay is down or blocked, or a wrong relay URL. Nothing can connect. |
+| wallet `state=connecting`, `failed_attempts` growing, `last_error="dial: timed out …"` | The connector is not running, has iroh disabled, or uses another relay. |
+| `last_error="connection ended: the peer rejected this endpoint as unauthorized"` | The two ends hold different passwords for the link (re-link). |
+| `last_error="connection ended: replaced by a newer connection"` | Harmless: the same device reconnected (e.g. network change). |
+| `path=relay` on a phone that could go direct | Normal behind strict NATs; the connection is still end-to-end encrypted. |

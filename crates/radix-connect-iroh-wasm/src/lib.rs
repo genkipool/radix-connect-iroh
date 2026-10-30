@@ -39,6 +39,24 @@ export type IrohErrorCode =
 /** Rejection value of every failing call. */
 export type IrohError = Error & { code: IrohErrorCode }
 export type IrohLogLevel = 'error' | 'warn' | 'info' | 'debug' | 'trace'
+/** A snapshot of a session's connectivity. Holds no secrets. */
+export type IrohDiagnostics = {
+  role: IrohRole
+  localEndpointId: string
+  peerEndpointId: string
+  relayUrl: string
+  /** Without the relay the peer cannot reach this end. */
+  relayConnected: boolean
+  relayError?: string
+  state: IrohConnectionState
+  path?: 'direct' | 'relay'
+  rttMs?: number
+  failedAttempts: number
+  lastError?: string
+  connectedForMs?: number
+  /** All of the above in one line, ready for a log. */
+  summary: string
+}
 export type IrohLogger = (level: IrohLogLevel, target: string, message: string) => void
 "#;
 
@@ -103,6 +121,50 @@ fn event_to_js(event: core::SessionEvent) -> JsValue {
     object.into()
 }
 
+fn diagnostics_to_js(diagnostics: core::Diagnostics) -> JsValue {
+    let object = Object::new();
+    let millis = |duration: Duration| JsValue::from_f64(duration.as_millis() as f64);
+    let set = |key: &str, value: JsValue| {
+        // Setting properties on a fresh plain object cannot fail.
+        let _ = Reflect::set(&object, &key.into(), &value);
+    };
+    set("summary", diagnostics.to_string().into());
+    set(
+        "role",
+        match diagnostics.role {
+            core::Role::Wallet => "wallet",
+            core::Role::Connector => "connector",
+        }
+        .into(),
+    );
+    set("localEndpointId", diagnostics.local_id.to_string().into());
+    set("peerEndpointId", diagnostics.peer_id.to_string().into());
+    set("relayUrl", diagnostics.relay_url.to_string().into());
+    set("relayConnected", diagnostics.relay_connected.into());
+    if let Some(error) = diagnostics.relay_error {
+        set("relayError", error.into());
+    }
+    set("state", state_name(diagnostics.state).into());
+    if let Some(path) = diagnostics.path {
+        let path = match path {
+            core::PathKind::Direct => "direct",
+            core::PathKind::Relay => "relay",
+        };
+        set("path", path.into());
+    }
+    if let Some(rtt) = diagnostics.rtt {
+        set("rttMs", millis(rtt));
+    }
+    set("failedAttempts", diagnostics.failed_attempts.into());
+    if let Some(error) = diagnostics.last_error {
+        set("lastError", error.into());
+    }
+    if let Some(connected_for) = diagnostics.connected_for {
+        set("connectedForMs", millis(connected_for));
+    }
+    object.into()
+}
+
 /// Takes ownership of the JS copy of the password and wipes it once parsed.
 fn password_from(mut bytes: Vec<u8>) -> Result<core::ConnectionPassword, JsValue> {
     let password = core::ConnectionPassword::from_slice(&bytes);
@@ -157,6 +219,12 @@ impl IrohSession {
     #[wasm_bindgen(unchecked_return_type = "IrohConnectionState")]
     pub fn state(&self) -> String {
         state_name(self.session.state()).to_owned()
+    }
+
+    /// A snapshot of the connectivity, for logs and diagnostics screens. Cheap.
+    #[wasm_bindgen(unchecked_return_type = "IrohDiagnostics")]
+    pub fn diagnostics(&self) -> JsValue {
+        diagnostics_to_js(self.session.diagnostics())
     }
 
     /// Sends one message (UTF-8 JSON) and resolves once the peer confirmed it.

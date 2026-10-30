@@ -222,21 +222,26 @@ async fn a_stranger_reaching_the_connector_directly_is_rejected_after_the_handsh
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_cancelled_send_is_never_delivered() {
+async fn a_cancelled_send_never_delivers_a_partial_message() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let (connector, wallet) = connected_pair(&relay_url, &password(15)).await;
 
-    // Abandon a large send half way, repeatedly: the connector's host, reading all
-    // along, must never see a partial (or empty) message.
+    // Abandon a large send at various points, repeatedly. One abandoned after the whole
+    // message went out may still be delivered (that is what "timeout: may have been
+    // delivered" means), but the connector's host, reading all along, must never see a
+    // partial or empty message.
     let large = "x".repeat(4 * 1024 * 1024);
     for delay in [1, 5, 20, 50] {
         let cut = time::timeout(Duration::from_millis(delay), wallet.send(&large)).await;
         assert!(cut.is_err(), "the send finished within {delay} ms");
         let leaked = time::timeout(Duration::from_millis(300), next_message(&connector)).await;
-        assert!(
-            leaked.is_err(),
-            "a cancelled send was delivered ({delay} ms)"
-        );
+        if let Ok(leaked) = leaked {
+            assert_eq!(
+                leaked.len(),
+                large.len(),
+                "a truncated message was delivered ({delay} ms)"
+            );
+        }
     }
     deliver(&wallet, &connector, "{\"after\":\"cancel\"}")
         .await
@@ -403,4 +408,73 @@ async fn closing_withdraws_messages_the_host_has_not_taken() {
         "{sent:?}"
     );
     assert_eq!(connector.next_event().await, None);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_describe_a_healthy_link() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(17)).await;
+    time::timeout(WAIT, wallet.shared.endpoint.online())
+        .await
+        .unwrap();
+
+    let snapshot = wallet.diagnostics();
+    assert_eq!(snapshot.role, Role::Wallet);
+    assert_eq!(snapshot.peer_id, connector.local_id());
+    assert_eq!(snapshot.state, ConnectionState::Connected);
+    assert!(snapshot.relay_connected, "{snapshot}");
+    assert!(snapshot.path.is_some(), "{snapshot}");
+    assert!(snapshot.connected_for.is_some(), "{snapshot}");
+    assert_eq!(snapshot.failed_attempts, 0);
+    assert_eq!(snapshot.last_error, None);
+    // The connector reaches the wallet through the relay only, like a browser.
+    assert_eq!(connector.diagnostics().path, Some(crate::PathKind::Relay));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_explain_why_the_connection_ended() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(18)).await;
+
+    connector.close().await;
+    wait_for_state(&wallet, ConnectionState::Connecting).await;
+    let snapshot = wallet.diagnostics();
+    assert_eq!(snapshot.connected_for, None);
+    assert_eq!(
+        snapshot.last_error.as_deref(),
+        Some("connection ended: the peer closed the session"),
+        "{snapshot}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn diagnostics_count_failed_attempts() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let mut wallet_config = config(&relay_url);
+    wallet_config.connect_timeout = Duration::from_millis(300);
+    // Nobody listens for this link.
+    let wallet = Session::start(&password(19), Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+
+    time::timeout(WAIT, async {
+        while wallet.diagnostics().failed_attempts < 2 {
+            time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let snapshot = wallet.diagnostics();
+    assert_eq!(snapshot.state, ConnectionState::Connecting);
+    assert!(
+        snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.starts_with("dial: ")),
+        "{snapshot}"
+    );
+    assert!(
+        snapshot.to_string().contains("failed_attempts="),
+        "{snapshot}"
+    );
 }

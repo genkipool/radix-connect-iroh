@@ -43,6 +43,7 @@
 )]
 
 mod config;
+pub mod diagnostics;
 mod error;
 mod guard;
 pub mod keys;
@@ -51,6 +52,7 @@ mod protocol;
 mod session;
 
 pub use config::{DEFAULT_ACK_TIMEOUT, DEFAULT_MAX_MESSAGE_SIZE, DEFAULT_RELAY_URL, SessionConfig};
+pub use diagnostics::{Diagnostics, PathKind};
 pub use error::{Error, SendError};
 pub use iroh::EndpointId;
 pub use keys::{ConnectionPassword, Role};

@@ -51,7 +51,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     loop {
         tokio::select! {
             event = session.next_event() => match event {
-                Some(SessionEvent::StateChanged(state)) => println!("state {state:?}"),
+                Some(SessionEvent::StateChanged(state)) => {
+                    println!("state {state:?}");
+                    eprintln!("diagnostics: {}", session.diagnostics());
+                }
                 Some(SessionEvent::Message(message)) => println!("message {message}"),
                 None => break,
             },
@@ -59,7 +62,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(line) if line.trim().is_empty() => {}
                 Some(line) => match session.send(line.trim()).await {
                     Ok(()) => println!("sent"),
-                    Err(error) => println!("send-failed {error}"),
+                    Err(error) => {
+                        println!("send-failed {error}");
+                        eprintln!("diagnostics: {}", session.diagnostics());
+                    }
                 },
                 None => break,
             },

@@ -240,3 +240,101 @@ fn write_failed(error: WriteError) -> SendError {
 fn lost(error: impl std::fmt::Display) -> SendError {
     SendError::ConnectionLost(error.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use iroh::endpoint::{ReadError, presets};
+    use iroh::test_utils::run_relay_server;
+    use iroh::tls::CaTlsConfig;
+    use iroh::{Endpoint, EndpointAddr, RelayMode};
+
+    use super::*;
+
+    /// Two endpoints connected through a local relay: these tests are about the
+    /// streams, not about reaching the peer. The relay guard must outlive the test.
+    async fn connected() -> (impl Sized, Endpoint, Endpoint, Connection, Connection) {
+        let (_map, relay_url, relay) = run_relay_server().await.unwrap();
+        let endpoint = |alpns: Vec<Vec<u8>>| {
+            Endpoint::builder(presets::Minimal)
+                .relay_mode(RelayMode::custom([relay_url.clone()]))
+                .ca_tls_config(CaTlsConfig::insecure_skip_verify())
+                .alpns(alpns)
+                .bind()
+        };
+        let server = endpoint(vec![ALPN.to_vec()]).await.unwrap();
+        let client = endpoint(Vec::new()).await.unwrap();
+        let target = EndpointAddr::new(server.id()).with_relay_url(relay_url.clone());
+        // The server's half of the handshake must run while the client connects.
+        let (client_conn, server_conn) = tokio::join!(client.connect(target, ALPN), async {
+            server.accept().await.unwrap().await
+        });
+        let server_conn = server_conn.unwrap();
+        (relay, server, client, client_conn.unwrap(), server_conn)
+    }
+
+    async fn read_one(conn: &Connection) -> Result<Incoming, ReadToEndError> {
+        let (send, mut recv) = conn.accept_bi().await.unwrap();
+        read_message(send, &mut recv, 1024).await
+    }
+
+    #[tokio::test]
+    async fn a_dropped_send_stream_is_reset_not_finished() {
+        let (_relay, _server, _client, client_conn, server_conn) = connected().await;
+        let (send, _recv) = client_conn.open_bi().await.unwrap();
+        let mut send = GuardedSendStream(Some(send));
+        send.write_all(&100u32.to_be_bytes()).await.unwrap();
+        send.write_all(b"partial").await.unwrap();
+        drop(send);
+        let read = read_one(&server_conn).await;
+        assert!(
+            matches!(read, Err(ReadToEndError::Read(ReadError::Reset(code))) if code == VarInt::from_u32(STREAM_ABANDONED)),
+            "{read:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_message_shorter_than_announced_is_not_delivered() {
+        let (_relay, _server, _client, client_conn, server_conn) = connected().await;
+        let (mut send, _recv) = client_conn.open_bi().await.unwrap();
+        send.write_all(&100u32.to_be_bytes()).await.unwrap();
+        send.write_all(b"partial").await.unwrap();
+        send.finish().unwrap();
+        assert!(matches!(
+            read_one(&server_conn).await,
+            Ok(Incoming::Incomplete)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_message_longer_than_announced_is_refused() {
+        let (_relay, _server, _client, client_conn, server_conn) = connected().await;
+        let (mut send, mut recv) = client_conn.open_bi().await.unwrap();
+        send.write_all(&2u32.to_be_bytes()).await.unwrap();
+        send.write_all(b"{}{}").await.unwrap();
+        send.finish().unwrap();
+        assert!(matches!(
+            read_one(&server_conn).await,
+            Ok(Incoming::Refused)
+        ));
+        assert_eq!(recv.read_to_end(1).await.unwrap(), [STATUS_REJECTED]);
+    }
+
+    #[tokio::test]
+    async fn a_complete_message_is_delivered_and_confirmed() {
+        let (_relay, _server, _client, client_conn, server_conn) = connected().await;
+        let (sent, read) = tokio::join!(
+            send_message(&client_conn, "{\"ok\":true}", 1024, Duration::from_secs(5)),
+            async {
+                match read_one(&server_conn).await {
+                    Ok(Incoming::Message(message, answer)) => {
+                        answer.acknowledge().await;
+                        message
+                    }
+                    other => panic!("{other:?}"),
+                }
+            }
+        );
+        assert_eq!(sent, Ok(()));
+        assert_eq!(read, "{\"ok\":true}");
+    }
+}

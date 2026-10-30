@@ -1,12 +1,14 @@
+use std::fmt::Display;
 use std::sync::Arc;
 use std::time::Duration;
 
 use iroh::endpoint::{Connection, IncomingAddr, QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode};
+use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, Watcher};
 use n0_future::task::{self, AbortOnDropHandle};
 use n0_future::{FuturesUnordered, StreamExt, time};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
 
+use crate::diagnostics::{self, Diagnostics};
 use crate::guard::PeerGuard;
 use crate::protocol::{self, ALPN, CloseCode, Incoming};
 use crate::{ConnectionPassword, Error, Role, SendError, SessionConfig};
@@ -98,6 +100,16 @@ struct Shared {
     events: mpsc::Sender<Queued>,
     /// Cuts the wallet's wait before the next dial attempt short.
     redial: Notify,
+    /// What went wrong lately, for [`Session::diagnostics`].
+    trouble: std::sync::Mutex<Trouble>,
+}
+
+/// The parts of [`Diagnostics`] that iroh does not keep for us.
+#[derive(Debug, Default)]
+struct Trouble {
+    last_error: Option<String>,
+    failed_attempts: u32,
+    connected_at: Option<time::Instant>,
 }
 
 impl Session {
@@ -160,6 +172,7 @@ impl Session {
             stopped: watch::Sender::new(false),
             events: events_tx,
             redial: Notify::new(),
+            trouble: std::sync::Mutex::default(),
         });
         tracing::info!(
             role = ?role,
@@ -211,13 +224,49 @@ impl Session {
             .borrow()
             .clone()
             .ok_or(SendError::NotConnected)?;
-        protocol::send_message(
+        let sent = protocol::send_message(
             &connection,
             message,
             self.shared.config.max_message_size,
             self.shared.config.ack_timeout,
         )
-        .await
+        .await;
+        if let Err(error) = &sent {
+            tracing::warn!(%error, bytes = message.len(), "could not send a message to the peer");
+            self.shared.record_error("send", error);
+        }
+        sent
+    }
+
+    /// A snapshot of the session's connectivity, for logs (its `Display` is one line)
+    /// and diagnostics screens. Cheap; contains no secrets.
+    pub fn diagnostics(&self) -> Diagnostics {
+        let shared = &self.shared;
+        let relays = shared.endpoint.home_relay_status().get();
+        let relay_connected = relays.iter().any(|relay| relay.is_connected());
+        let relay_error = relays
+            .iter()
+            .find_map(|relay| relay.last_error().map(|error| error.to_string()));
+        let (path, rtt) = shared
+            .connection
+            .borrow()
+            .as_ref()
+            .map_or((None, None), diagnostics::selected_path);
+        let trouble = shared.trouble();
+        Diagnostics {
+            role: shared.role,
+            local_id: shared.endpoint.id(),
+            peer_id: shared.peer,
+            relay_url: shared.config.relay_url.clone(),
+            relay_connected,
+            relay_error,
+            state: *shared.state.borrow(),
+            path,
+            rtt,
+            failed_attempts: trouble.failed_attempts,
+            last_error: trouble.last_error.clone(),
+            connected_for: trouble.connected_at.map(|since| since.elapsed()),
+        }
     }
 
     /// Waits for the next event. Returns `None` once the session is closed.
@@ -297,6 +346,37 @@ impl Shared {
         }
     }
 
+    fn trouble(&self) -> std::sync::MutexGuard<'_, Trouble> {
+        // A panic while holding this lock cannot leave it inconsistent: recover.
+        self.trouble
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn record_error(&self, context: &str, error: impl Display) {
+        self.trouble().last_error = Some(format!("{context}: {error}"));
+    }
+
+    fn record_failed_attempt(&self, error: impl Display) {
+        let mut trouble = self.trouble();
+        trouble.failed_attempts = trouble.failed_attempts.saturating_add(1);
+        trouble.last_error = Some(format!("dial: {error}"));
+    }
+
+    fn record_connected(&self) {
+        let mut trouble = self.trouble();
+        trouble.failed_attempts = 0;
+        trouble.connected_at = Some(time::Instant::now());
+    }
+
+    fn record_disconnected(&self, reason: Option<String>) {
+        let mut trouble = self.trouble();
+        trouble.connected_at = None;
+        if let Some(reason) = reason {
+            trouble.last_error = Some(format!("connection ended: {reason}"));
+        }
+    }
+
     /// Records and reports a state change. Only the driver calls it, from one task,
     /// so reported states follow the real order. Nothing changes once closed.
     async fn set_state(&self, state: ConnectionState) {
@@ -316,14 +396,20 @@ impl Shared {
 }
 
 async fn drive(shared: Arc<Shared>) {
-    match shared.role {
-        Role::Wallet => {
-            tokio::select! {
-                () = dial(&shared) => {}
-                () = ignore_incoming(&shared) => {}
+    let run = async {
+        match shared.role {
+            Role::Wallet => {
+                tokio::select! {
+                    () = dial(&shared) => {}
+                    () = ignore_incoming(&shared) => {}
+                }
             }
+            Role::Connector => accept(&shared).await,
         }
-        Role::Connector => accept(&shared).await,
+    };
+    tokio::select! {
+        () = run => {}
+        () = log_relay_status(&shared) => {}
     }
     shared.endpoint.close().await;
     shared.stopped.send_replace(true);
@@ -350,12 +436,27 @@ async fn dial(shared: &Arc<Shared>) {
             Ok(Ok(connection)) => {
                 delay = shared.config.min_reconnect_delay;
                 shared.connection.send_replace(Some(connection.clone()));
+                shared.record_connected();
                 shared.set_state(ConnectionState::Connected).await;
-                serve(shared, &connection).await;
+                let ended = serve(shared, &connection).await;
                 shared.connection.send_replace(None);
+                shared.record_disconnected(ended);
             }
-            Ok(Err(error)) => tracing::debug!(%error, "could not reach the connector extension"),
-            Err(_) => tracing::debug!("dialing the connector extension timed out"),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "could not reach the connector");
+                shared.record_failed_attempt(&error);
+            }
+            Err(_) => {
+                tracing::debug!(timeout = ?shared.config.connect_timeout, "dialing the connector timed out: is it running, with iroh, on the same relay?");
+                shared.record_failed_attempt(
+                    "timed out (is the connector running, with iroh, on the same relay?)",
+                );
+            }
+        }
+        let failed_attempts = shared.trouble().failed_attempts;
+        // Every few failures, say it at a level hosts log by default.
+        if failed_attempts > 0 && failed_attempts.is_power_of_two() {
+            tracing::info!(failed_attempts, "still trying to reach the connector");
         }
         tokio::select! {
             biased;
@@ -364,6 +465,26 @@ async fn dial(shared: &Arc<Shared>) {
             () = time::sleep(delay) => delay = (delay * 2).min(shared.config.max_reconnect_delay),
         }
     }
+}
+
+/// Logs when this end gains or loses its relay: without it the peer cannot reach it,
+/// which is the first thing to check when a link does not connect. Never returns.
+async fn log_relay_status(shared: &Shared) {
+    let mut statuses = shared.endpoint.home_relay_status().stream();
+    let mut was_connected = false;
+    while let Some(statuses) = statuses.next().await {
+        let connected = statuses.iter().any(|relay| relay.is_connected());
+        let error = statuses
+            .iter()
+            .find_map(|relay| relay.last_error().map(|error| error.to_string()));
+        if connected && !was_connected {
+            tracing::info!(relay = %shared.config.relay_url, "connected to the relay");
+        } else if !connected && (was_connected || error.is_some()) {
+            tracing::warn!(relay = %shared.config.relay_url, error = error.as_deref().unwrap_or("none"), "not connected to the relay: the peer cannot reach this end");
+        }
+        was_connected = connected;
+    }
+    std::future::pending::<()>().await;
 }
 
 /// Wallet: drop every incoming connection attempt without answering. The endpoint has
@@ -391,16 +512,17 @@ async fn ignore_incoming(shared: &Shared) {
 /// `Disconnected` behind.
 async fn accept(shared: &Arc<Shared>) {
     let mut handshakes = FuturesUnordered::new();
-    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<usize>();
+    let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<(usize, Option<String>)>();
     let mut serving: Option<(usize, AbortOnDropHandle<()>)> = None;
     loop {
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
-            Some(ended) = ended_rx.recv() => {
+            Some((ended, reason)) = ended_rx.recv() => {
                 if serving.as_ref().is_some_and(|(id, _)| *id == ended) {
                     serving = None;
                     shared.connection.send_replace(None);
+                    shared.record_disconnected(reason);
                     shared.set_state(ConnectionState::Disconnected).await;
                 }
             }
@@ -409,10 +531,12 @@ async fn accept(shared: &Arc<Shared>) {
                     Ok(Ok(connection)) => connection,
                     Ok(Err(error)) => {
                         tracing::debug!(%error, "incoming handshake failed");
+                        shared.record_error("incoming handshake", &error);
                         continue;
                     }
                     Err(_) => {
                         tracing::debug!("incoming handshake timed out");
+                        shared.record_error("incoming handshake", "timed out");
                         continue;
                     }
                 };
@@ -420,6 +544,7 @@ async fn accept(shared: &Arc<Shared>) {
                 // invariant never depends on hook plumbing alone.
                 if connection.remote_id() != shared.peer {
                     connection.close(CloseCode::Unauthorized.into(), b"unauthorized");
+                    shared.record_error("incoming connection", "rejected an endpoint that is not the link's wallet");
                     continue;
                 }
                 let id = connection.stable_id();
@@ -432,10 +557,11 @@ async fn accept(shared: &Arc<Shared>) {
                 serving = Some((
                     id,
                     AbortOnDropHandle::new(task::spawn(async move {
-                        serve(&task_shared, &connection).await;
-                        let _ = ended.send(id);
+                        let reason = serve(&task_shared, &connection).await;
+                        let _ = ended.send((id, reason));
                     })),
                 ));
+                shared.record_connected();
                 shared.set_state(ConnectionState::Connected).await;
             }
             incoming = shared.endpoint.accept() => {
@@ -464,20 +590,23 @@ async fn accept(shared: &Arc<Shared>) {
 }
 
 /// Delivers the peer's messages, one stream at a time, until the connection ends or
-/// the session closes. Each message is confirmed only once the host took it.
-async fn serve(shared: &Shared, connection: &Connection) {
-    tracing::info!(peer = %shared.peer.fmt_short(), "connected to the peer");
+/// the session closes. Each message is confirmed only once the host took it. Returns
+/// why the connection ended, if it did not end because the session closed.
+async fn serve(shared: &Shared, connection: &Connection) -> Option<String> {
+    let (path, rtt) = diagnostics::selected_path(connection);
+    tracing::info!(peer = %shared.peer.fmt_short(), ?path, ?rtt, "connected to the peer");
     loop {
         let stream = tokio::select! {
             biased;
-            () = shared.wait_closed() => return,
+            () = shared.wait_closed() => return None,
             stream = connection.accept_bi() => stream,
         };
         let (send, mut recv) = match stream {
             Ok(stream) => stream,
             Err(error) => {
-                tracing::info!(%error, "connection to the peer ended");
-                return;
+                let reason = diagnostics::describe_connection_end(&error);
+                tracing::info!(%reason, "connection to the peer ended");
+                return Some(reason);
             }
         };
         let read = time::timeout(
@@ -489,7 +618,7 @@ async fn serve(shared: &Shared, connection: &Connection) {
             Ok(Ok(Incoming::Message(message, answer))) => {
                 let (taken, on_taken) = oneshot::channel();
                 if !shared.emit(Queued::Message { message, taken }).await {
-                    return;
+                    return None;
                 }
                 // If the peer stops waiting first, dropping `on_taken` withdraws the
                 // message from the host, and dropping `answer` resets the stream.
@@ -498,7 +627,7 @@ async fn serve(shared: &Shared, connection: &Connection) {
                 let taken = tokio::select! {
                     biased;
                     taken = on_taken => taken.is_ok(),
-                    () = shared.wait_closed() => return,
+                    () = shared.wait_closed() => return None,
                     () = answer.peer_gave_up() => false,
                 };
                 if taken {
@@ -506,10 +635,14 @@ async fn serve(shared: &Shared, connection: &Connection) {
                 }
             }
             Ok(Ok(Incoming::Refused | Incoming::Incomplete)) => {}
-            Ok(Err(error)) => tracing::debug!(%error, "could not read an incoming message"),
+            Ok(Err(error)) => {
+                tracing::debug!(%error, "could not read an incoming message");
+                shared.record_error("receive", &error);
+            }
             Err(_) => {
                 let _ = recv.stop(0u32.into());
                 tracing::warn!("an incoming message did not arrive in time");
+                shared.record_error("receive", "a message did not arrive in time");
             }
         }
     }

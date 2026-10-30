@@ -57,6 +57,14 @@ cargo run --example peer -- connector [relay-url]   # pretend to be the extensio
 
 Lines typed on stdin are sent as messages; events are printed.
 
+## Diagnosing a link
+
+Every session exposes `diagnostics()` (see [`docs/BINDINGS.md`](docs/BINDINGS.md#diagnostics)
+for the fields and how to read them), and the library logs why things fail: relay
+lost, dial timeouts with the usual causes, why a connection ended, refused messages.
+The `peer` example prints both, which makes it the quickest way to check one end of a
+link by hand.
+
 ## Relays
 
 Both ends of a link must use the same relay, as both ends of a WebRTC link use the
