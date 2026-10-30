@@ -89,23 +89,29 @@ The connector checks the remote id again before using a connection.
 Before any handshake work, the connector screens connection attempts:
 
 - Through the relay the sender's endpoint id is attested (relay clients authenticate
-  with their key): the link's wallet is always let in, attempts from any other id are
-  ignored without an answer.
+  with their key): attempts from any other id are ignored without an answer, and the
+  link's wallet gets a pool of its own of at most 4 parallel handshakes. The relay is
+  a third party: the cap bounds the handshake work a faulty relay could cause in the
+  wallet's name (an honest wallet has one attempt in progress, two around a network
+  change).
 - Direct UDP attempts — which a browser never receives — must first prove they can
   receive at their source address (a stateless QUIC retry), then share a pool of at
   most 8 parallel handshakes of 15 s each, where any key can complete the TLS handshake
   and the hook then rejects it. Filling that pool never keeps the wallet out, since its
-  attempts through the relay bypass it.
+  attempts through the relay use their own pool.
 
 The wallet's endpoint registers no ALPN and drops every incoming attempt unanswered.
 
 When an authenticated connection arrives while another one is active, the new one wins
 and the old one is closed with application error `2` (`replaced`): the wallet only
 dials again when it believes the previous connection is dead (app restart, network
-change), and a dead QUIC connection can take a while to time out. A wallet whose
-connection was replaced waits the longest back-off before dialing again, so two
-sessions holding the same key (another device, a second app instance) do not keep
-taking the link from each other.
+change), and a dead QUIC connection can take a while to time out. A wallet that is told
+its connection was replaced waits the longest back-off before dialing again, doubling
+up to 5 minutes while it keeps happening, so two sessions holding the same key do not
+keep taking the link from each other. The notice reaches it only over a direct path:
+relays and iroh route an endpoint id to its newest holder, so through the relay the
+older session hears nothing, its connection times out, and its dials go to the newer
+one — the link follows the newest holder.
 
 ## 6. Messages
 
@@ -163,12 +169,18 @@ so a host that cannot keep up makes the peer's sends time out instead of growing
 
 States: `connecting` (wallet dialing), `connected`, `disconnected`.
 
-- The wallet dials, serves the connection until it ends, waits 0.5 s doubling up to
-  15 s, and dials again. A dial attempt is abandoned after 20 s. `networkChanged()`
-  (called by the host on connectivity changes) re-dials at once.
+- The wallet dials, serves the connection until it ends (reporting `connecting` at
+  once), waits 0.5 s doubling up to 15 s, and dials again. A dial attempt is abandoned
+  after 20 s. `networkChanged()` (called by the host on connectivity changes) cuts the
+  wait short when the change happens while the wallet waits or dials; changes made
+  while connected are handled by iroh within the connection and do not count later.
+- States are reported as their latest value: a host that reads late gets the current
+  state, not every state in between.
 - The connector starts `disconnected` and becomes `connected` whenever an
   authenticated connection is accepted.
-- Closing a session closes its connection with application error `0` and its endpoint.
+- Closing a session lets confirmations already written reach the peer (up to 1 s), so
+  a message the host took is not reported to its sender as lost, then closes its
+  connection with application error `0` and its endpoint.
 
 ## 8. Security considerations
 
@@ -193,7 +205,8 @@ link the links of one wallet or one browser; whoever operates a relay or the loo
 still correlate them by IP address and timing, as a signaling or TURN server can today.
 With a custom relay nothing is published. A malicious relay — or a tampered lookup record, which the
 connector's signature prevents — can drop traffic (denial of service), like a signaling
-or TURN server can today, but cannot read or forge it: the QUIC handshake still
+or TURN server can today, and make the connector start handshakes in the wallet's name
+(at most 4 at a time), but cannot read or forge traffic: the QUIC handshake still
 authenticates the derived endpoint keys. Relay TLS certificates
 are verified against the embedded web PKI roots.
 

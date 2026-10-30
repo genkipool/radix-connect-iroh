@@ -5,11 +5,14 @@ use std::time::Duration;
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::{AddrFilter, PkarrPublisher, PkarrResolver};
-use iroh::endpoint::{Connection, IncomingAddr, QuicTransportConfig, presets};
-use iroh::{Endpoint, EndpointAddr, EndpointId, RelayMode, Watcher};
+use iroh::endpoint::{Connection, IncomingAddr, PathEvent, QuicTransportConfig, presets};
+use iroh::{
+    Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, TransportAddr,
+    Watcher,
+};
 use n0_future::task::{self, AbortOnDropHandle};
 use n0_future::{FuturesUnordered, StreamExt, time};
-use tokio::sync::{Mutex, Notify, mpsc, oneshot, watch};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 
 use crate::config::Relays;
 use crate::diagnostics::{self, Diagnostics};
@@ -17,9 +20,10 @@ use crate::guard::PeerGuard;
 use crate::protocol::{self, ALPN, CloseCode, Incoming};
 use crate::{ConnectionPassword, Error, Role, SendError, SessionConfig};
 
-/// Events buffered for the host. At most one of them is a message: the next message is
-/// only read once the host has taken the previous one.
-const EVENT_BUFFER: usize = 64;
+/// Messages waiting for the host. Normally at most one: the next message is only read
+/// once the host took the previous one (a replaced connection may leave one behind,
+/// which is then withdrawn).
+const MESSAGE_BUFFER: usize = 4;
 
 /// How long creating the local endpoint may take.
 const BIND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -27,14 +31,28 @@ const BIND_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long [`Session::close`] waits for the endpoint to close gracefully.
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Incoming handshakes the Connector Extension processes at the same time.
-///
-/// Connections arriving through the relay are screened before any handshake work: the
-/// relay attests the sender's endpoint id, and anyone but the link's wallet is ignored.
-/// Only direct (UDP) connection attempts, which a browser never receives, reach this
-/// pool unscreened; any key can complete a handshake, the guard hook rejects strangers
-/// only afterwards.
-const MAX_PENDING_HANDSHAKES: usize = 8;
+/// Direct (UDP) handshakes the connector processes at the same time. A browser never
+/// receives direct attempts; elsewhere they arrive unscreened (any key can complete a
+/// handshake, the guard hook rejects strangers only afterwards), so they share this
+/// bounded pool once they proved their source address.
+const MAX_DIRECT_HANDSHAKES: usize = 8;
+
+/// Handshakes the link's wallet may have in progress at once through the relay. An
+/// honest wallet has one, two around a network change; the cap bounds what a faulty
+/// relay could make the connector do in the wallet's name, and is separate from the
+/// direct pool so that strangers can never keep the wallet out.
+const MAX_PEER_HANDSHAKES: usize = 4;
+
+/// Longest wait before taking a link back from another session holding the same key.
+const MAX_REPLACED_DELAY: Duration = Duration::from_secs(300);
+
+/// How long closing waits for confirmations already written to reach the peer.
+const ACK_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Bytes the peer may have in flight across all its streams, instead of QUIC's
+/// unbounded default: messages are read one at a time, so this only bounds what an
+/// authenticated peer can make us buffer.
+const RECEIVE_WINDOW: u32 = 4 * 1024 * 1024;
 
 /// How long an incoming QUIC handshake may take.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
@@ -64,15 +82,22 @@ pub enum SessionEvent {
     Message(String),
 }
 
-/// What the session queues for the host.
+/// A message waiting for the host. `taken` tells the stream that brought it to confirm
+/// it.
 #[derive(Debug)]
-enum Queued {
-    State(ConnectionState),
-    /// `taken` tells the stream that delivered the message to confirm it.
-    Message {
-        message: String,
-        taken: oneshot::Sender<()>,
-    },
+struct Delivery {
+    message: String,
+    taken: oneshot::Sender<()>,
+}
+
+/// What the host reads through [`Session::next_event`]. States are a watch rather than
+/// queued events, so a host that falls behind never blocks the connection handling:
+/// it gets the latest state.
+#[derive(Debug)]
+struct Inbox {
+    messages: mpsc::Receiver<Delivery>,
+    state: watch::Receiver<ConnectionState>,
+    reported: ConnectionState,
 }
 
 /// One end of a Radix Connect link over iroh.
@@ -86,7 +111,7 @@ enum Queued {
 #[derive(Debug)]
 pub struct Session {
     shared: Arc<Shared>,
-    events: Mutex<mpsc::Receiver<Queued>>,
+    inbox: Mutex<Inbox>,
     _driver: AbortOnDropHandle<()>,
 }
 
@@ -101,9 +126,13 @@ struct Shared {
     closed: watch::Sender<bool>,
     /// Set by the driver once it stopped and closed the endpoint.
     stopped: watch::Sender<bool>,
-    events: mpsc::Sender<Queued>,
-    /// Cuts the wallet's wait before the next dial attempt short.
-    redial: Notify,
+    messages: mpsc::Sender<Delivery>,
+    /// Bumped on every network change: a change made while the wallet waits to dial
+    /// again cuts the wait short.
+    network: watch::Sender<u64>,
+    /// Confirmations written but not yet acknowledged by the peer; closing waits for
+    /// them briefly so that a message the host took is not reported as lost.
+    acks_in_flight: watch::Sender<usize>,
     /// What went wrong lately, for [`Session::diagnostics`].
     trouble: std::sync::Mutex<Trouble>,
 }
@@ -130,6 +159,9 @@ impl Session {
         let transport = QuicTransportConfig::builder()
             .max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into())
             .max_concurrent_uni_streams(0u32.into())
+            .receive_window(RECEIVE_WINDOW.into())
+            // The protocol uses no datagrams: don't buffer any.
+            .datagram_receive_buffer_size(None)
             .build();
         // Only the Connector Extension accepts connections: an endpoint without ALPNs
         // refuses every incoming handshake.
@@ -152,7 +184,7 @@ impl Session {
             Role::Wallet => ConnectionState::Connecting,
             Role::Connector => ConnectionState::Disconnected,
         };
-        let (events_tx, events_rx) = mpsc::channel(EVENT_BUFFER);
+        let (messages_tx, messages_rx) = mpsc::channel(MESSAGE_BUFFER);
         let shared = Arc::new(Shared {
             endpoint,
             role,
@@ -162,8 +194,9 @@ impl Session {
             state: watch::Sender::new(initial_state),
             closed: watch::Sender::new(false),
             stopped: watch::Sender::new(false),
-            events: events_tx,
-            redial: Notify::new(),
+            messages: messages_tx,
+            network: watch::Sender::new(0),
+            acks_in_flight: watch::Sender::new(0),
             trouble: std::sync::Mutex::default(),
         });
         tracing::info!(
@@ -174,9 +207,14 @@ impl Session {
             "radix connect iroh session started"
         );
         let driver = AbortOnDropHandle::new(task::spawn(drive(shared.clone())));
+        let inbox = Inbox {
+            messages: messages_rx,
+            state: shared.state.subscribe(),
+            reported: initial_state,
+        };
         Ok(Self {
             shared,
-            events: Mutex::new(events_rx),
+            inbox: Mutex::new(inbox),
             _driver: driver,
         })
     }
@@ -284,19 +322,30 @@ impl Session {
     ///
     /// Cancel-safe: a cancelled call neither loses nor confirms a message.
     pub async fn next_event(&self) -> Option<SessionEvent> {
-        let mut events = self.events.lock().await;
+        let mut inbox = self.inbox.lock().await;
+        let Inbox {
+            messages,
+            state,
+            reported,
+        } = &mut *inbox;
         loop {
-            let queued = tokio::select! {
+            tokio::select! {
                 biased;
                 () = self.shared.wait_closed() => return None,
-                queued = events.recv() => queued?,
-            };
-            match queued {
-                Queued::State(state) => return Some(SessionEvent::StateChanged(state)),
-                // The stream that brought the message is gone (the peer gave up waiting
-                // or the connection ended): the peer was not confirmed and will send it
-                // again if it still matters, so delivering it now could duplicate it.
-                Queued::Message { message, taken } => {
+                // States first: a connection is reported before its first message.
+                Ok(()) = state.changed() => {
+                    let latest = *state.borrow_and_update();
+                    if latest != *reported {
+                        *reported = latest;
+                        return Some(SessionEvent::StateChanged(latest));
+                    }
+                }
+                delivery = messages.recv() => {
+                    let Delivery { message, taken } = delivery?;
+                    // If the stream that brought the message is gone (the peer gave up
+                    // waiting or the connection ended), the peer was not confirmed and
+                    // will send it again if it still matters: delivering it now could
+                    // duplicate it.
                     if taken.send(()).is_ok() {
                         return Some(SessionEvent::Message(message));
                     }
@@ -310,21 +359,20 @@ impl Session {
     /// once. Mobile hosts should call it from their connectivity callbacks: iroh cannot
     /// detect network changes by itself on Android.
     pub async fn network_changed(&self) {
-        self.shared.redial.notify_one();
+        self.shared
+            .network
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
         self.shared.endpoint.network_change().await;
     }
 
     /// Closes the connection (telling the peer) and the endpoint, and waits until both
-    /// are closed. Idempotent, and cancel-safe: the endpoint is closed by the session's
-    /// own task even if this call is abandoned.
+    /// are closed. Idempotent, and cancel-safe: the session's own task closes them even
+    /// if this call is abandoned.
     pub async fn close(&self) {
         if !self.shared.closed.send_replace(true) {
             self.shared
                 .state
                 .send_replace(ConnectionState::Disconnected);
-            if let Some(connection) = self.shared.connection.send_replace(None) {
-                connection.close(CloseCode::Normal.into(), b"closed");
-            }
         }
         let mut stopped = self.shared.stopped.subscribe();
         // `wait_for` only fails if the sender is dropped, which outlives `self`. The
@@ -344,12 +392,12 @@ impl Shared {
         let _ = closed.wait_for(|closed| *closed).await;
     }
 
-    /// Queues an event for the host. Returns `false` once the session is closing.
-    async fn emit(&self, event: Queued) -> bool {
+    /// Hands a message to the host. Returns `false` once the session is closing.
+    async fn deliver(&self, delivery: Delivery) -> bool {
         tokio::select! {
             biased;
             () = self.wait_closed() => false,
-            sent = self.events.send(event) => sent.is_ok(),
+            sent = self.messages.send(delivery) => sent.is_ok(),
         }
     }
 
@@ -384,9 +432,9 @@ impl Shared {
         }
     }
 
-    /// Records and reports a state change. Only the driver calls it, from one task,
-    /// so reported states follow the real order. Nothing changes once closed.
-    async fn set_state(&self, state: ConnectionState) {
+    /// Records a state change for the host. Only the driver calls it, from one task,
+    /// so states follow the real order. Nothing changes once closed.
+    fn set_state(&self, state: ConnectionState) {
         if self.is_closed() {
             return;
         }
@@ -397,7 +445,21 @@ impl Shared {
         });
         if changed {
             tracing::debug!(?state, peer = %self.peer.fmt_short(), "connection state changed");
-            self.emit(Queued::State(state)).await;
+        }
+    }
+
+    /// Lets confirmations already written reach the peer, briefly, then closes the
+    /// connection, telling the peer.
+    async fn close_connection(&self) {
+        let mut acks = self.acks_in_flight.subscribe();
+        // `wait_for` only fails if the sender is dropped, which outlives `self`.
+        let _ = time::timeout(
+            ACK_FLUSH_TIMEOUT,
+            acks.wait_for(|in_flight| *in_flight == 0),
+        )
+        .await;
+        if let Some(connection) = self.connection.send_replace(None) {
+            connection.close(CloseCode::Normal.into(), b"closed");
         }
     }
 }
@@ -414,7 +476,7 @@ fn with_relays(
     #[cfg(test)]
     let builder = test_builder(builder, config);
     match &config.relays {
-        Relays::Custom(url) => builder.relay_mode(RelayMode::custom([url.clone()])),
+        Relays::Custom(url) => builder.relay_mode(custom_relay_mode(url)),
         Relays::Public => {
             #[cfg(test)]
             if let Some(test) = &config.test_public_infrastructure {
@@ -439,6 +501,16 @@ fn with_relays(
                 }
             }
         }
+    }
+}
+
+/// A single custom relay. A plain-http relay is a local development one, which serves
+/// no QUIC address discovery: don't probe it for that.
+fn custom_relay_mode(url: &RelayUrl) -> RelayMode {
+    if url.scheme() == "http" {
+        RelayMode::Custom(RelayMap::from_iter([RelayConfig::new(url.clone(), None)]))
+    } else {
+        RelayMode::custom([url.clone()])
     }
 }
 
@@ -472,6 +544,7 @@ async fn drive(shared: Arc<Shared>) {
         () = run => {}
         () = log_relay_status(&shared) => {}
     }
+    shared.close_connection().await;
     shared.endpoint.close().await;
     shared.stopped.send_replace(true);
     tracing::info!(local = %shared.endpoint.id().fmt_short(), "radix connect iroh session closed");
@@ -485,9 +558,13 @@ async fn dial(shared: &Arc<Shared>) {
         Relays::Public => EndpointAddr::new(shared.peer),
         Relays::Custom(url) => EndpointAddr::new(shared.peer).with_relay_url(url.clone()),
     };
+    let mut network = shared.network.subscribe();
     let mut delay = shared.config.min_reconnect_delay;
+    let mut replaced_in_a_row = 0;
     loop {
-        shared.set_state(ConnectionState::Connecting).await;
+        shared.set_state(ConnectionState::Connecting);
+        // This attempt already uses the current network.
+        network.mark_unchanged();
         let attempt = time::timeout(
             shared.config.connect_timeout,
             shared.endpoint.connect(peer_addr.clone(), ALPN),
@@ -501,15 +578,24 @@ async fn dial(shared: &Arc<Shared>) {
             Ok(Ok(connection)) => {
                 shared.connection.send_replace(Some(connection.clone()));
                 shared.record_connected();
-                shared.set_state(ConnectionState::Connected).await;
+                shared.set_state(ConnectionState::Connected);
                 let ended = serve(shared, &connection).await;
                 shared.connection.send_replace(None);
                 shared.record_disconnected(ended);
-                let replaced = was_replaced(&connection);
-                if replaced {
-                    tracing::warn!("another session took over this link; backing off");
+                // Not connected any more, and about to dial again.
+                shared.set_state(ConnectionState::Connecting);
+                // iroh carried the connection across the network changes made meanwhile.
+                network.mark_unchanged();
+                if was_replaced(&connection) {
+                    replaced_in_a_row += 1;
+                    tracing::warn!(
+                        replaced_in_a_row,
+                        "another session took over this link; backing off"
+                    );
+                } else {
+                    replaced_in_a_row = 0;
                 }
-                delay = delay_after_connection(replaced, &shared.config);
+                delay = delay_after_connection(replaced_in_a_row, &shared.config);
             }
             Ok(Err(error)) => {
                 tracing::debug!(%error, "could not reach the connector");
@@ -527,10 +613,13 @@ async fn dial(shared: &Arc<Shared>) {
         if failed_attempts > 0 && failed_attempts.is_power_of_two() {
             tracing::info!(failed_attempts, "still trying to reach the connector");
         }
+        // A network change cuts the wait short, unless another session took the link
+        // over: then only time does, or the two would keep taking it from each other.
+        let follow_network = replaced_in_a_row == 0;
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
-            () = shared.redial.notified() => delay = shared.config.min_reconnect_delay,
+            Ok(()) = network.changed(), if follow_network => delay = shared.config.min_reconnect_delay,
             () = time::sleep(delay) => delay = (delay * 2).min(shared.config.max_reconnect_delay),
         }
     }
@@ -586,6 +675,7 @@ async fn ignore_incoming(shared: &Shared) {
 /// `Disconnected` behind.
 async fn accept(shared: &Arc<Shared>) {
     let mut handshakes = FuturesUnordered::new();
+    let mut pending = PendingHandshakes::default();
     let (ended_tx, mut ended_rx) = mpsc::unbounded_channel::<(usize, Option<String>)>();
     let mut serving: Option<(usize, AbortOnDropHandle<()>)> = None;
     loop {
@@ -597,10 +687,11 @@ async fn accept(shared: &Arc<Shared>) {
                     serving = None;
                     shared.connection.send_replace(None);
                     shared.record_disconnected(reason);
-                    shared.set_state(ConnectionState::Disconnected).await;
+                    shared.set_state(ConnectionState::Disconnected);
                 }
             }
-            Some(handshake) = handshakes.next(), if !handshakes.is_empty() => {
+            Some((from_peer, handshake)) = handshakes.next(), if !handshakes.is_empty() => {
+                pending.finished(from_peer);
                 let connection: Connection = match handshake {
                     Ok(Ok(connection)) => connection,
                     Ok(Err(error)) => {
@@ -636,7 +727,7 @@ async fn accept(shared: &Arc<Shared>) {
                     })),
                 ));
                 shared.record_connected();
-                shared.set_state(ConnectionState::Connected).await;
+                shared.set_state(ConnectionState::Connected);
             }
             incoming = shared.endpoint.accept() => {
                 let Some(incoming) = incoming else {
@@ -646,11 +737,14 @@ async fn accept(shared: &Arc<Shared>) {
                     &incoming.remote_addr(),
                     incoming.remote_addr_validated(),
                     shared.peer,
-                    handshakes.len(),
+                    pending,
                 );
                 match decision {
-                    Admission::Handshake => match incoming.accept() {
-                        Ok(accepting) => handshakes.push(time::timeout(HANDSHAKE_TIMEOUT, accepting)),
+                    Admission::Handshake { from_peer } => match incoming.accept() {
+                        Ok(accepting) => {
+                            pending.started(from_peer);
+                            handshakes.push(tagged(from_peer, time::timeout(HANDSHAKE_TIMEOUT, accepting)));
+                        }
                         Err(error) => tracing::debug!(%error, "could not accept an incoming connection"),
                     },
                     // Costs us nothing: a genuine sender answers, a spoofed source cannot.
@@ -671,12 +765,49 @@ async fn accept(shared: &Arc<Shared>) {
 
 /// Delay before redialing once a connection ended. When another session holding this
 /// link's key (another device, or a second app instance) took over, redialing at once
-/// would just take the link back, and the two would keep replacing each other.
-fn delay_after_connection(replaced: bool, config: &SessionConfig) -> Duration {
-    if replaced {
-        config.max_reconnect_delay
-    } else {
-        config.min_reconnect_delay
+/// would just take the link back, and the two would keep replacing each other: wait the
+/// longest back-off, doubling (up to 5 minutes) while it keeps happening.
+fn delay_after_connection(replaced_in_a_row: u32, config: &SessionConfig) -> Duration {
+    match replaced_in_a_row {
+        0 => config.min_reconnect_delay,
+        n => config
+            .max_reconnect_delay
+            .saturating_mul(1 << (n - 1).min(8))
+            .min(MAX_REPLACED_DELAY.max(config.max_reconnect_delay)),
+    }
+}
+
+/// Pairs a future's output with a tag, so futures of one type can be told apart in a
+/// [`FuturesUnordered`].
+async fn tagged<F: Future>(tag: bool, future: F) -> (bool, F::Output) {
+    (tag, future.await)
+}
+
+/// Incoming handshakes in progress, by origin.
+#[derive(Debug, Clone, Copy, Default)]
+struct PendingHandshakes {
+    /// Through the relay, from the link's wallet.
+    from_peer: usize,
+    /// Direct (UDP) attempts, from anyone.
+    direct: usize,
+}
+
+impl PendingHandshakes {
+    fn started(&mut self, from_peer: bool) {
+        *self.count(from_peer) += 1;
+    }
+
+    fn finished(&mut self, from_peer: bool) {
+        let count = self.count(from_peer);
+        *count = count.saturating_sub(1);
+    }
+
+    fn count(&mut self, from_peer: bool) -> &mut usize {
+        if from_peer {
+            &mut self.from_peer
+        } else {
+            &mut self.direct
+        }
     }
 }
 
@@ -691,23 +822,37 @@ fn was_replaced(connection: &Connection) -> bool {
 /// What to do with an incoming connection attempt, before any handshake work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Admission {
-    Handshake,
+    Handshake {
+        /// Attested by the relay as coming from the link's wallet.
+        from_peer: bool,
+    },
     /// Ask the sender to prove it can receive at its source address first.
     ValidateAddress,
     Ignore,
 }
 
 /// Through the relay the sender's id is attested before any handshake work: the
-/// link's wallet is always let in (strangers can never fill its way), anyone else is
-/// ignored. Direct attempts (native connectors only; a browser has no UDP) must first
-/// prove their source address, then share the bounded handshake pool.
-fn admission(addr: &IncomingAddr, validated: bool, peer: EndpointId, pending: usize) -> Admission {
+/// link's wallet gets its own small pool (strangers can never fill its way), anyone
+/// else is ignored. Direct attempts (native connectors only; a browser has no UDP)
+/// must first prove their source address, then share the bounded direct pool.
+fn admission(
+    addr: &IncomingAddr,
+    validated: bool,
+    peer: EndpointId,
+    pending: PendingHandshakes,
+) -> Admission {
     match addr {
-        IncomingAddr::Relay { endpoint_id, .. } if *endpoint_id == peer => Admission::Handshake,
+        IncomingAddr::Relay { endpoint_id, .. } if *endpoint_id == peer => {
+            if pending.from_peer < MAX_PEER_HANDSHAKES {
+                Admission::Handshake { from_peer: true }
+            } else {
+                Admission::Ignore
+            }
+        }
         IncomingAddr::Relay { .. } => Admission::Ignore,
         _ if !validated => Admission::ValidateAddress,
-        _ if pending >= MAX_PENDING_HANDSHAKES => Admission::Ignore,
-        _ => Admission::Handshake,
+        _ if pending.direct >= MAX_DIRECT_HANDSHAKES => Admission::Ignore,
+        _ => Admission::Handshake { from_peer: false },
     }
 }
 
@@ -715,12 +860,18 @@ fn admission(addr: &IncomingAddr, validated: bool, peer: EndpointId, pending: us
 /// the session closes. Each message is confirmed only once the host took it. Returns
 /// why the connection ended, if it did not end because the session closed.
 async fn serve(shared: &Shared, connection: &Connection) -> Option<String> {
+    // Subscribed before reading the current path, so no switch goes unnoticed.
+    let mut path_events = connection.path_events();
     let (path, rtt) = diagnostics::selected_path(connection);
     tracing::info!(peer = %shared.peer.fmt_short(), ?path, ?rtt, "connected to the peer");
     loop {
         let stream = tokio::select! {
             biased;
             () = shared.wait_closed() => return None,
+            Some(event) = path_events.next() => {
+                log_path_event(connection, &event);
+                continue;
+            }
             stream = connection.accept_bi() => stream,
         };
         let (send, mut recv) = match stream {
@@ -739,7 +890,7 @@ async fn serve(shared: &Shared, connection: &Connection) -> Option<String> {
         match read {
             Ok(Ok(Incoming::Message(message, answer))) => {
                 let (taken, on_taken) = oneshot::channel();
-                if !shared.emit(Queued::Message { message, taken }).await {
+                if !shared.deliver(Delivery { message, taken }).await {
                     return None;
                 }
                 // If the peer stops waiting first, dropping `on_taken` withdraws the
@@ -753,7 +904,13 @@ async fn serve(shared: &Shared, connection: &Connection) -> Option<String> {
                     () = answer.peer_gave_up() => false,
                 };
                 if taken {
-                    answer.acknowledge().await;
+                    shared
+                        .acks_in_flight
+                        .send_modify(|in_flight| *in_flight += 1);
+                    answer.acknowledge(ACK_FLUSH_TIMEOUT).await;
+                    shared
+                        .acks_in_flight
+                        .send_modify(|in_flight| *in_flight -= 1);
                 }
             }
             Ok(Ok(Incoming::Refused | Incoming::Incomplete)) => {}
@@ -767,6 +924,25 @@ async fn serve(shared: &Shared, connection: &Connection) -> Option<String> {
                 shared.record_error("receive", "a message did not arrive in time");
             }
         }
+    }
+}
+
+/// Logs when the connection switches between the relay and a direct path. Never logs
+/// addresses: they are the users' IP addresses, and logs get shared.
+fn log_path_event(connection: &Connection, event: &PathEvent) {
+    match event {
+        PathEvent::Selected { remote_addr, .. } => {
+            let path = match remote_addr {
+                TransportAddr::Relay(_) => "relay",
+                _ => "direct",
+            };
+            tracing::info!(path, "the connection now goes through a new path");
+        }
+        PathEvent::Lagged { .. } => {
+            let (path, _) = diagnostics::selected_path(connection);
+            tracing::debug!(?path, "missed path events; current path");
+        }
+        _ => {}
     }
 }
 

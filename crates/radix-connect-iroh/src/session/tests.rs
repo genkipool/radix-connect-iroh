@@ -529,7 +529,7 @@ async fn with_public_relays_the_wallet_finds_the_connector_through_address_looku
 }
 
 #[test]
-fn the_wallet_is_admitted_through_the_relay_even_when_the_pool_is_full() {
+fn admission_keeps_the_wallet_and_strangers_in_separate_bounded_pools() {
     let link = password(21);
     let wallet = link.endpoint_id(Role::Wallet);
     let stranger = password(22).endpoint_id(Role::Wallet);
@@ -538,25 +538,57 @@ fn the_wallet_is_admitted_through_the_relay_even_when_the_pool_is_full() {
         endpoint_id,
     };
     let direct = IncomingAddr::Ip("192.0.2.7:4433".parse().unwrap());
-    let full = MAX_PENDING_HANDSHAKES;
+    let idle = PendingHandshakes::default();
+    let direct_full = PendingHandshakes {
+        direct: MAX_DIRECT_HANDSHAKES,
+        ..idle
+    };
+    let peer_full = PendingHandshakes {
+        from_peer: MAX_PEER_HANDSHAKES,
+        ..idle
+    };
+    let peer = Admission::Handshake { from_peer: true };
 
-    // The link's wallet is never kept out by attempts that fill the pool.
+    // Direct attempts filling their pool never keep the link's wallet out.
+    assert_eq!(admission(&relay(wallet), true, wallet, direct_full), peer);
+    // But attempts in the wallet's name are bounded too: a relay attests the id, and
+    // the relay is a third party.
     assert_eq!(
-        admission(&relay(wallet), true, wallet, full),
-        Admission::Handshake
+        admission(&relay(wallet), true, wallet, peer_full),
+        Admission::Ignore
     );
     // Strangers via the relay never get handshake work.
     assert_eq!(
-        admission(&relay(stranger), true, wallet, 0),
+        admission(&relay(stranger), true, wallet, idle),
         Admission::Ignore
     );
-    // Direct attempts prove their source address first, then share the bounded pool.
+    // Direct attempts prove their source address first, then share the bounded pool,
+    // which the wallet's attempts do not use up.
     assert_eq!(
-        admission(&direct, false, wallet, 0),
+        admission(&direct, false, wallet, idle),
         Admission::ValidateAddress
     );
-    assert_eq!(admission(&direct, true, wallet, 0), Admission::Handshake);
-    assert_eq!(admission(&direct, true, wallet, full), Admission::Ignore);
+    assert_eq!(
+        admission(&direct, true, wallet, peer_full),
+        Admission::Handshake { from_peer: false }
+    );
+    assert_eq!(
+        admission(&direct, true, wallet, direct_full),
+        Admission::Ignore
+    );
+}
+
+#[test]
+fn pending_handshakes_are_counted_by_origin() {
+    let mut pending = PendingHandshakes::default();
+    pending.started(true);
+    pending.started(false);
+    pending.started(false);
+    pending.finished(false);
+    assert_eq!((pending.from_peer, pending.direct), (1, 1));
+    pending.finished(true);
+    pending.finished(true);
+    assert_eq!((pending.from_peer, pending.direct), (0, 1));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -580,14 +612,110 @@ async fn a_large_message_is_not_cut_short_by_the_confirmation_timeout() {
 }
 
 #[test]
-fn a_replaced_wallet_waits_the_longest_before_redialing() {
-    let config = config(&"https://relay.example.com".parse().unwrap());
+fn a_wallet_replaced_again_and_again_waits_longer_and_longer() {
+    let mut config = config(&"https://relay.example.com".parse().unwrap());
+    config.max_reconnect_delay = Duration::from_secs(15);
     assert_eq!(
-        delay_after_connection(true, &config),
-        config.max_reconnect_delay
-    );
-    assert_eq!(
-        delay_after_connection(false, &config),
+        delay_after_connection(0, &config),
         config.min_reconnect_delay
     );
+    assert_eq!(delay_after_connection(1, &config), Duration::from_secs(15));
+    assert_eq!(delay_after_connection(2, &config), Duration::from_secs(30));
+    assert_eq!(delay_after_connection(3, &config), Duration::from_secs(60));
+    assert_eq!(delay_after_connection(9, &config), MAX_REPLACED_DELAY);
+    assert_eq!(
+        delay_after_connection(u32::MAX, &config),
+        MAX_REPLACED_DELAY
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_waiting_wallet_redials_only_on_network_changes_made_while_it_waits() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(24);
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    // Long waits between attempts: only a network change can make the wallet dial soon.
+    let mut wallet_config = config(&relay_url);
+    wallet_config.min_reconnect_delay = Duration::from_secs(60);
+    wallet_config.max_reconnect_delay = Duration::from_secs(60);
+    let wallet = Session::start(&link, Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    // Android reports network changes often, also while connected; iroh carries the
+    // connection across them, so they must not count once it ended.
+    wallet.network_changed().await;
+    connector.close().await;
+
+    // The wallet says at once that it is no longer connected, though it waits to dial.
+    wait_for_state(&wallet, ConnectionState::Connecting).await;
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(connector.state(), ConnectionState::Disconnected);
+
+    // A network change made while it waits is a reason to dial at once.
+    wallet.network_changed().await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_right_after_taking_a_message_still_confirms_it() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(25)).await;
+
+    // The sender must learn the message arrived, or it would retry and duplicate it.
+    let (sent, ()) = tokio::join!(wallet.send("{\"last\":true}"), async {
+        assert_eq!(next_message(&connector).await, "{\"last\":true}");
+        connector.close().await;
+    });
+    sent.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_host_that_reads_late_gets_the_latest_state_not_a_backlog() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(26);
+    // The wallet's host reads nothing while the connector restarts several times: the
+    // wallet keeps reconnecting meanwhile.
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    for _ in 0..3 {
+        let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+            .await
+            .unwrap();
+        wait_for_state(&connector, ConnectionState::Connected).await;
+        connector.close().await;
+    }
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    time::timeout(WAIT, async {
+        while wallet.state() != ConnectionState::Connected {
+            time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("the wallet did not reconnect");
+
+    // Reading late, the host gets the current state, not the stale ones in between.
+    assert_eq!(
+        wallet.next_event().await,
+        Some(SessionEvent::StateChanged(ConnectionState::Connected))
+    );
+    assert!(
+        time::timeout(Duration::from_millis(300), wallet.next_event())
+            .await
+            .is_err()
+    );
+    deliver(&connector, &wallet, "{\"still\":\"working\"}")
+        .await
+        .unwrap();
 }

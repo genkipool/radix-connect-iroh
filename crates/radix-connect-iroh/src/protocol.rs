@@ -227,11 +227,16 @@ async fn reject(mut stream: GuardedSendStream) {
 pub(crate) struct Answer(GuardedSendStream);
 
 impl Answer {
-    /// Confirms to the peer that the application took its message.
-    pub(crate) async fn acknowledge(self) {
+    /// Confirms to the peer that the application took its message, and waits (at most
+    /// `flush_timeout`) for the peer to acknowledge the confirmation, so that closing
+    /// right after does not discard it.
+    pub(crate) async fn acknowledge(self, flush_timeout: Duration) {
         let Self(mut stream) = self;
-        if stream.write_all(&[STATUS_RECEIVED]).await.is_ok() {
-            let _ = stream.finish();
+        if stream.write_all(&[STATUS_RECEIVED]).await.is_err() {
+            return;
+        }
+        if let Ok(stream) = stream.finish() {
+            let _ = time::timeout(flush_timeout, stream.stopped()).await;
         }
     }
 
@@ -352,7 +357,7 @@ mod tests {
             async {
                 match read_one(&server_conn).await {
                     Ok(Incoming::Message(message, answer)) => {
-                        answer.acknowledge().await;
+                        answer.acknowledge(Duration::from_secs(1)).await;
                         message
                     }
                     other => panic!("{other:?}"),

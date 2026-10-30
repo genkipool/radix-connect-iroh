@@ -47,7 +47,8 @@ class IrohSession : AutoCloseable {          // close() frees the native object
     fun state(): IrohConnectionState
     fun diagnostics(): IrohDiagnostics        // connectivity snapshot; `summary` is one log line
     suspend fun send(message: String)         // throws IrohException; NotConnected immediately
-    suspend fun nextEvent(): IrohSessionEvent? // null once shut down; taking a Message confirms it to the peer
+    suspend fun nextEvent(): IrohSessionEvent? // null once shut down; taking a Message confirms it to the peer;
+                                               // states come as their latest value
     suspend fun networkChanged()              // call from ConnectivityManager callbacks
     suspend fun shutdown()                    // tells the peer, idempotent; then close()
 }
