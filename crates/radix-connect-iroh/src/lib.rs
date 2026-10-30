@@ -50,6 +50,7 @@ mod guard;
 pub mod keys;
 pub mod logging;
 mod protocol;
+mod relay_health;
 mod session;
 
 pub use config::{

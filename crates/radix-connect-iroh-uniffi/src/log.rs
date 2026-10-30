@@ -1,11 +1,16 @@
 //! Forwards the library's `tracing` events to a logger of the host (Timber on
-//! Android), so iroh problems show up next to the app's own logs.
+//! Android), so iroh problems show up next to the app's own logs. Every line carries
+//! the context it happened in (`session=… role=… local=… peer=… conn=… send_seq=…`),
+//! and IP addresses are redacted.
 
 use std::sync::{Arc, Once, RwLock};
 
-use radix_connect_iroh::logging::{format_event, host_log_enabled};
+use radix_connect_iroh::logging::{
+    DiagnosticsLayer, format_event_with_context, host_log_enabled, needed_for_diagnostics,
+};
 use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 
 /// Severity of a log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, uniffi::Enum)]
@@ -71,13 +76,21 @@ pub fn iroh_install_log_sink(sink: Arc<dyn IrohLogSink>, max_level: IrohLogLevel
             max_level: max_level.into(),
         });
     }
+    install_subscriber();
+    tracing::callsite::rebuild_interest_cache();
+}
+
+/// Installs the library's subscriber, once. Sessions need it even without a sink: it
+/// notices when another holder of a link's key takes this end's place on the relay.
+pub(crate) fn install_subscriber() {
     SUBSCRIBER.call_once(|| {
-        let subscriber = tracing_subscriber::registry().with(SinkLayer);
+        let subscriber = tracing_subscriber::registry()
+            .with(DiagnosticsLayer)
+            .with(SinkLayer);
         // Fails only if the process already has a global subscriber, which then
         // receives our events instead.
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
-    tracing::callsite::rebuild_interest_cache();
 }
 
 fn enabled(metadata: &Metadata<'_>) -> bool {
@@ -90,12 +103,12 @@ fn enabled(metadata: &Metadata<'_>) -> bool {
 
 struct SinkLayer;
 
-impl<S: Subscriber> Layer<S> for SinkLayer {
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SinkLayer {
     fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
-        enabled(metadata)
+        enabled(metadata) || needed_for_diagnostics(metadata)
     }
 
-    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
         if !enabled(metadata) {
             return;
@@ -108,7 +121,7 @@ impl<S: Subscriber> Layer<S> for SinkLayer {
             sink.log(
                 (*metadata.level()).into(),
                 metadata.target().to_owned(),
-                format_event(event),
+                format_event_with_context(event, &ctx),
             );
         }
     }

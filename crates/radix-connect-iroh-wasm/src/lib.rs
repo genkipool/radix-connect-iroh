@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use js_sys::{Function, Object, Promise, Reflect};
 use radix_connect_iroh as core;
-use radix_connect_iroh::logging::{format_event, host_log_enabled};
+use radix_connect_iroh::logging::{
+    DiagnosticsLayer, format_event_with_context, host_log_enabled, needed_for_diagnostics,
+};
 use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+use tracing_subscriber::registry::LookupSpan;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{future_to_promise, spawn_local};
 use zeroize::Zeroize;
@@ -59,6 +62,11 @@ export type IrohDiagnostics = {
   connectedForMs?: number
   /** All of the above in one line, ready for a log. */
   summary: string
+  /**
+   * Another device or browser profile with this link took this end's place on the
+   * relay: the peer cannot reach this end until it leaves or this end reconnects.
+   */
+  keyCollision: boolean
 }
 export type IrohLogger = (level: IrohLogLevel, target: string, message: string) => void
 "#;
@@ -168,6 +176,7 @@ fn diagnostics_to_js(diagnostics: core::Diagnostics) -> JsValue {
     if let Some(connected_for) = diagnostics.connected_for {
         set("connectedForMs", millis(connected_for));
     }
+    set("keyCollision", diagnostics.key_collision.into());
     object.into()
 }
 
@@ -204,6 +213,7 @@ impl IrohSession {
         if let Some(ack_timeout_ms) = ack_timeout_ms {
             config = config.with_ack_timeout(Duration::from_millis(ack_timeout_ms.into()));
         }
+        install_subscriber();
         let session = core::Session::start(&password, role, config)
             .await
             .map_err(error_from)?;
@@ -261,6 +271,19 @@ impl IrohSession {
                 .next_event()
                 .await
                 .map_or(JsValue::UNDEFINED, event_to_js))
+        })
+    }
+
+    /// Reports that the network changed, or that the machine woke up or the extension
+    /// became active again: a waiting wallet dials at once, and the current connection
+    /// is checked, dropped within seconds if the peer no longer answers (instead of
+    /// looking connected until it times out).
+    #[wasm_bindgen(js_name = networkChanged, unchecked_return_type = "Promise<void>")]
+    pub fn network_changed(&self) -> Promise {
+        let session = self.session.clone();
+        future_to_promise(async move {
+            session.network_changed().await;
+            Ok(JsValue::UNDEFINED)
         })
     }
 
@@ -340,7 +363,9 @@ fn level_name(level: Level) -> &'static str {
 }
 
 /// Sends log lines up to `maxLevel` to `logger(level, target, message)`, replacing any
-/// previous logger. iroh and QUIC internals are capped at `info`.
+/// previous logger. iroh and QUIC internals are capped at `info` (`warn` unless
+/// `maxLevel` is `debug` or `trace`). Lines carry their context (`session=… role=…
+/// conn=…`) and never an IP address.
 #[wasm_bindgen(js_name = setLogger)]
 pub fn set_logger(
     #[wasm_bindgen(unchecked_param_type = "IrohLogger")] logger: Function,
@@ -348,13 +373,21 @@ pub fn set_logger(
 ) -> Result<(), JsValue> {
     let max_level = level_from(&max_level)?;
     LOGGER.with(|installed| *installed.borrow_mut() = Some((logger, max_level)));
-    SUBSCRIBER.call_once(|| {
-        let _ = tracing::subscriber::set_global_default(
-            tracing_subscriber::registry().with(JsLogLayer),
-        );
-    });
+    install_subscriber();
     tracing::callsite::rebuild_interest_cache();
     Ok(())
+}
+
+/// Installs the library's subscriber, once. Sessions need it even without a logger: it
+/// notices when another holder of a link's key takes this end's place on the relay.
+fn install_subscriber() {
+    SUBSCRIBER.call_once(|| {
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::registry()
+                .with(DiagnosticsLayer)
+                .with(JsLogLayer),
+        );
+    });
 }
 
 fn logger_enabled(metadata: &Metadata<'_>) -> bool {
@@ -367,12 +400,12 @@ fn logger_enabled(metadata: &Metadata<'_>) -> bool {
 
 struct JsLogLayer;
 
-impl<S: Subscriber> Layer<S> for JsLogLayer {
+impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for JsLogLayer {
     fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
-        logger_enabled(metadata)
+        logger_enabled(metadata) || needed_for_diagnostics(metadata)
     }
 
-    fn on_event(&self, event: &Event<'_>, _: Context<'_, S>) {
+    fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
         let metadata = event.metadata();
         if !logger_enabled(metadata) {
             return;
@@ -389,7 +422,7 @@ impl<S: Subscriber> Layer<S> for JsLogLayer {
                 &JsValue::NULL,
                 &level_name(*metadata.level()).into(),
                 &metadata.target().into(),
-                &format_event(event).into(),
+                &format_event_with_context(event, &ctx).into(),
             );
         }
     }

@@ -162,6 +162,9 @@ pub struct IrohDiagnostics {
     pub connected_for_ms: Option<u64>,
     /// All of the above in one line, ready for a log.
     pub summary: String,
+    /// Another device or app instance with this link took this end's place on the
+    /// relay: the peer cannot reach this end until it leaves or this end reconnects.
+    pub key_collision: bool,
 }
 
 impl From<core::Diagnostics> for IrohDiagnostics {
@@ -189,6 +192,7 @@ impl From<core::Diagnostics> for IrohDiagnostics {
             failed_attempts: diagnostics.failed_attempts,
             last_error: diagnostics.last_error,
             connected_for_ms: diagnostics.connected_for.map(millis),
+            key_collision: diagnostics.key_collision,
         }
     }
 }
@@ -331,6 +335,7 @@ impl IrohSession {
     ) -> Result<Arc<Self>, IrohError> {
         let password = password_from(password)?;
         let config = core::SessionConfig::try_from(config)?;
+        log::install_subscriber();
         let session =
             on_runtime(async move { core::Session::start(&password, role.into(), config).await })
                 .await??;
@@ -377,7 +382,10 @@ impl IrohSession {
         self.session.next_event().await.map(Into::into)
     }
 
-    /// Reports a change of the device's network (call from connectivity callbacks).
+    /// Reports a change of the device's network, or the app returning to the
+    /// foreground (call from connectivity callbacks and on resume): a waiting wallet
+    /// dials at once, and the current connection is checked, dropped within seconds if
+    /// the peer no longer answers.
     pub async fn network_changed(&self) {
         let session = self.session.clone();
         // Best effort: if the runtime is gone there is nothing to re-check.
@@ -509,6 +517,7 @@ mod tests {
             Some("https://relay.invalid/")
         );
         assert!(!diagnostics.public_relays);
+        assert!(!diagnostics.key_collision);
         assert!(diagnostics.summary.starts_with("connector "));
         assert_eq!(
             n0_future::future::block_on(session.send("{}".to_owned())),

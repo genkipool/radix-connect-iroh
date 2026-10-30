@@ -36,16 +36,30 @@ pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 8 * 1024 * 1024;
 /// the peer opened its stream. It keeps a stalled stream from blocking the link.
 const DEFAULT_RECEIVE_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// First and maximum delay between two dial attempts of the wallet. Only the wallet
-/// dials, so these bound how long a connector that comes online (a browser started, a
-/// server's session reopened) waits for the wallet: at most one attempt plus one delay.
+/// First and maximum delay between two dial attempts of the wallet while it retries
+/// quickly. Only the wallet dials, so these bound how long a connector that comes online
+/// (a browser started, a server's session reopened) waits for the wallet: at most one
+/// attempt plus one delay.
 const DEFAULT_MIN_RECONNECT_DELAY: Duration = Duration::from_millis(500);
 const DEFAULT_MAX_RECONNECT_DELAY: Duration = Duration::from_secs(5);
+
+/// How long the wallet retries quickly after the connection was lost, the session
+/// started or the host reported a wake-up (network change, app back in the foreground).
+const DEFAULT_FAST_RETRY_PERIOD: Duration = Duration::from_secs(120);
+
+/// Delay between two dial attempts once the quick period is over: a connector that
+/// stays offline (a closed browser, an old link) must not keep the phone's radio awake
+/// with an attempt every few seconds. A wake-up dials at once and retries quickly again.
+const DEFAULT_SLOW_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 
 /// How long a single dial attempt may take, including the address lookup and the QUIC
 /// handshake (1–2 s in practice, even over a mobile network). An attempt in progress
 /// also completes when the connector comes online meanwhile.
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// A message waiting this long for the host to take it is logged as a warning: hosts
+/// must keep reading events, or the peer's sends time out.
+const DEFAULT_HOST_SLOW_AFTER: Duration = Duration::from_secs(5);
 
 /// Settings of a [`Session`](crate::Session). Both ends of a link must use the same
 /// [`Relays`].
@@ -58,6 +72,9 @@ pub struct SessionConfig {
     pub(crate) connect_timeout: Duration,
     pub(crate) min_reconnect_delay: Duration,
     pub(crate) max_reconnect_delay: Duration,
+    pub(crate) fast_retry_period: Duration,
+    pub(crate) slow_reconnect_delay: Duration,
+    pub(crate) host_slow_after: Duration,
     /// Tests run a relay with a self-signed certificate.
     #[cfg(test)]
     pub(crate) insecure_skip_relay_cert_verify: bool,
@@ -117,6 +134,9 @@ impl SessionConfig {
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             min_reconnect_delay: DEFAULT_MIN_RECONNECT_DELAY,
             max_reconnect_delay: DEFAULT_MAX_RECONNECT_DELAY,
+            fast_retry_period: DEFAULT_FAST_RETRY_PERIOD,
+            slow_reconnect_delay: DEFAULT_SLOW_RECONNECT_DELAY,
+            host_slow_after: DEFAULT_HOST_SLOW_AFTER,
             #[cfg(test)]
             insecure_skip_relay_cert_verify: false,
             #[cfg(test)]

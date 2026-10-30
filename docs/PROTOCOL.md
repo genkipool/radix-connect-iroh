@@ -165,24 +165,53 @@ never pass for a complete one.
 The receiver reads the next message only after the application took the previous one,
 so a host that cannot keep up makes the peer's sends time out instead of growing memory.
 
+**Liveness check.** A stream finished at once, without any data, asks whether the peer
+still answers. The sender only needs the peer's QUIC acknowledgement of that empty
+stream (sent whatever the peer's application is doing, even while it waits for its
+host), or any answer on it; receivers treat it as a liveness check and finish their
+half without data (version 0.1.0 resets it as an incomplete message, which is just as
+good an answer). It is no message: it is neither delivered nor confirmed, and it is
+not an error. See §7 for when it is sent.
+
 ## 7. Connection lifecycle
 
 States: `connecting` (wallet dialing), `connected`, `disconnected`.
 
 - The wallet dials, serves the connection until it ends (reporting `connecting` at
-  once), waits 0.5 s doubling up to 5 s, and dials again. A dial attempt is abandoned
-  after 10 s; one in progress also completes when the connector comes online meanwhile.
-  Since only the wallet dials, a connector that comes online waits at most about 15 s
-  for it (one attempt plus one delay), usually a few seconds. `networkChanged()` (called by the host on connectivity changes) cuts the
-  wait short when the change happens while the wallet waits or dials; changes made
-  while connected are handled by iroh within the connection and do not count later.
+  once) and dials again on this schedule:
+  - **quickly for 2 minutes** after the connection was lost, the session started, or the
+    last wake-up: waits 0.5 s doubling up to 5 s between attempts;
+  - **then every 30 s**, so that links to connectors that stay offline (a closed
+    browser, an old link) do not keep the phone's radio awake with an address lookup
+    and relay traffic every few seconds;
+  - a **wake-up** — `networkChanged()`, which hosts call on connectivity changes, when
+    the app returns to the foreground and when the machine wakes up — dials at once and
+    starts the quick period again; a connection resets the schedule.
+
+  A dial attempt is abandoned after 10 s; one in progress also completes when the
+  connector comes online meanwhile. Since only the wallet dials, a connector that comes
+  online is reached about at once after a wake-up, within about 15 s (one attempt plus
+  one delay) during the quick period, and within about 40 s after it. Changes reported
+  while connected are handled by iroh within the connection and do not cut a later wait
+  short.
+- `networkChanged()` also **checks the current connection** (§6, liveness check):
+  without an answer within three round trips (at least 1.5 s, at most 4 s; 4 s while
+  the relay the connection goes through is reconnecting, as after the app was in the
+  background), the connection is closed with application error `3` (`unresponsive`)
+  instead of looking connected until QUIC's 30 s idle timeout. The wallet then dials
+  again at once, the connector reports `disconnected`. Reports within 2 s of a check
+  share the next one; only one check runs at a time.
 - States are reported as their latest value: a host that reads late gets the current
   state, not every state in between.
 - The connector starts `disconnected` and becomes `connected` whenever an
   authenticated connection is accepted.
-- Closing a session lets confirmations already written reach the peer (up to 1 s), so
-  a message the host took is not reported to its sender as lost, then closes its
-  connection with application error `0` and its endpoint.
+- Closing a session lets the confirmations of messages the host already took reach the
+  peer (up to 1 s), so a message the host took is not reported to its sender as lost,
+  then closes its connection with application error `0` and its endpoint.
+
+Application error codes when closing a connection: `0` closed by its owner, `1`
+unauthorized (§5), `2` replaced by a newer connection (§5), `3` unresponsive (no answer
+to a liveness check). Peers describe codes they do not know generically.
 
 ## 8. Security considerations
 
@@ -245,3 +274,62 @@ at the same time; each message is sent on exactly one transport (iroh when conne
 otherwise WebRTC, falling back only when the first reports `notConnected`), and
 messages are accepted from both. Peers that do not speak iroh simply never connect
 over it.
+
+## 10. Diagnostics
+
+The library logs through `tracing`; the bindings forward its lines to the host's logger
+(`irohInstallLogSink` / `setLogger`) and keep them free of secrets and personal data.
+
+**What a line never contains:** the connection password, any key, a message's content
+(sizes only), or an IP address. Lines meant for a host are scanned and IP addresses
+replaced by `<ip>` (ports kept), iroh's own lines included, since iroh logs addresses
+when it reports paths and errors. Endpoint ids appear in short form (10 hex digits).
+
+**Context of a line.** Every line carries the session it belongs to: `session=` (a
+number unique in the process), `role=`, `local=` and `peer=` (short ids); lines about a
+connection add `conn=` (the session's number for it, 1, 2, ...), lines about a message
+`send_seq=` (outgoing) or `recv_seq=` (incoming streams, liveness checks included).
+iroh's own lines from the relay tasks of a session carry its context too. Fields are
+`key=value`, values with spaces are quoted, durations are in milliseconds (`_ms`) and a
+timeout is logged with the limit it hit (`timeout_ms=… elapsed_ms=…`).
+
+**Levels.** `error`: a bug (an invariant broke). `warn`: something the user notices or
+that needs action. `info`: lifecycle milestones. `debug`: per attempt and per message.
+`trace`: noisy internals. iroh's and QUIC's own lines are capped at `info` (at `warn`
+unless the host logs at `debug` or more).
+
+**Events.**
+
+| Area | Event (message starts with) | Level |
+|---|---|---|
+| Session | `session started` (version, relays, timeouts, limits, retry schedule); `closing the session` (state, messages queued for the host, confirmations owed); `closing before every confirmation reached the peer`; `session closed` (lifetime, close duration, confirmations flushed or not); `closing the session timed out`; `session dropped without being closed` | info (warn for the timeouts) |
+| Dialing (wallet) | `dialing the connector` (attempt, reason: `first`, `retry`, `disconnected`, `replaced`, `unresponsive`, `network_changed`, time waited); `dial attempt failed` (outcome: `no_address`, `timeout`, `relay_unreachable`, `unauthorized`, `alpn_mismatch`, `handshake_failed`, `local`, `other`; elapsed and timeout; whether the relay is connected; the relay address lookup found for the connector); `waiting before dialing again` (delay, reason) | debug |
+| | `still trying to reach the connector` at attempts 1, 2, 4, 8... with the last outcome and a hint; `still cannot reach the connector` once out of reach for a minute | info / warn |
+| | `the connector is still unreachable: retrying less often` (once per slow period); `the network changed: dialing again now` | info |
+| Connections | `connected to the peer` (path, RTT, setup time, attempt); `disconnected from the peer` (reason, duration, bytes, lost packets, times a stream limit was reached); `connectivity snapshot` (the one-line diagnostics, on every connect and disconnect) | info |
+| | `a new connection from the wallet replaced the current one` (connector); `another session holding this link's wallet key ... took the connection over` (wallet, with the back-off) | info / warn |
+| | `the connection now goes directly between the devices` (time to the first direct path); `the connection switched paths` (relay ↔ direct); moves between paths of one kind | info / debug |
+| | `checking that the peer still answers` (why, deadline); `the peer answered the liveness check` (time, RTT); `the peer did not answer the liveness check: dropping the connection`; `answered a liveness check from the peer` | info / info / warn / debug |
+| Relay | `connected to the relay`; `moved to another relay`; `lost the connection to the relay`; `cannot connect to the relay` (with the error, or why the relay denied access) | info / warn |
+| | `another device or app instance with this link's key connected to the relay; this end no longer receives through it` (and `Diagnostics::key_collision`); `the relay delivers to this end again` | warn / info |
+| Admission (connector) | `an incoming handshake started` (origin, handshakes pending per pool); `an incoming handshake failed` / `timed out` (outcome) | debug (info for the wallet's) |
+| | `ignored a connection attempt from a stranger through the relay` (per attempt) and a count every minute | debug / info |
+| | `ignored an attempt in the wallet's name: ... handshake pool is full`; `ignored a direct connection attempt: the pool of direct handshakes is full`; `rejected a connection from an endpoint that is not the link's peer` — the first of each per minute, then a count | warn |
+| | `asked a direct connection attempt to prove its source address first` | debug |
+| Sending | `sending a message` (bytes); `message transferred` (time until the peer acknowledged every byte); `message confirmed by the peer` (transfer and confirmation times); `waited for the peer to allow another stream` | debug |
+| | `could not send a message to the peer` (outcome: `timeout`, `too_large`, `rejected`, `connection_lost`; phase: `transfer` or `confirmation`, with that phase's timeout) | warn |
+| | `send refused: not connected` / `the session is closed`; `the host cancelled the send` and `reset a stream abandoned before it was finished` | debug |
+| Receiving | `receiving a message` (announced bytes); `message received: handing it to the host` (messages already queued); `the host took a message` (time it waited); `confirmation sent and acknowledged by the peer` | debug |
+| | `the host has not taken a message yet` (once per message, after 5 s: hosts must keep reading events) | warn |
+| | `withdrew a message the host had not taken` (the peer gave up or the connection ended) | info |
+| | `refused an incoming message over the size limit`; `refused a malformed incoming message`; `an incoming message did not arrive in time` | warn |
+| | `the peer abandoned the message before it was complete`; `skipped a withdrawn message` | debug |
+| Network | `the host reported a network change` (state); `connection state changed` (from, to) | info / debug |
+
+Repeating events that someone else controls are rate-limited (strangers, full pools,
+unauthorized connections: once a minute in full, then counted); dial failures are
+summarised at powers of two. The relay's notice that another holder of the link's key
+connected (`SameEndpointIdConnected`) is only logged by iroh; the library recognises it
+in iroh's relay events, within the session's span, so it is attributed to the right
+session even with several sessions of one key in a process. Only the end that was
+displaced learns it, and only when both holders use the same relay.

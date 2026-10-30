@@ -66,10 +66,13 @@ Lines typed on stdin are sent as messages; events are printed.
 ## Diagnosing a link
 
 Every session exposes `diagnostics()` (see [`docs/BINDINGS.md`](docs/BINDINGS.md#diagnostics)
-for the fields and how to read them), and the library logs why things fail: relay
-lost, dial timeouts with the usual causes, why a connection ended, refused messages.
-The `peer` example prints both, which makes it the quickest way to check one end of a
-link by hand.
+for the fields and how to read them), and the library logs every step with its context
+and why things fail: relay lost, dial attempts and their outcome, why a connection
+ended, refused or timed-out messages, another device holding the same link (the events
+are listed in [`docs/PROTOCOL.md`](docs/PROTOCOL.md#10-diagnostics); lines never contain
+secrets, message contents or IP addresses). The `peer` example prints both
+(`RADIX_CONNECT_LOG=debug` for every step; `/network` reports a network change), which
+makes it the quickest way to check one end of a link by hand.
 
 ## Relays
 

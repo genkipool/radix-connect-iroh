@@ -1,6 +1,10 @@
+use std::sync::{Arc, Mutex, PoisonError};
+
 use iroh::endpoint::{AfterHandshakeOutcome, BeforeConnectOutcome, Connection, EndpointHooks};
 use iroh::{EndpointAddr, EndpointId};
+use n0_future::time::Instant;
 
+use crate::diagnostics::Tally;
 use crate::protocol::{ALPN, CloseCode};
 
 /// Restricts an endpoint to the single peer of its link.
@@ -13,11 +17,14 @@ use crate::protocol::{ALPN, CloseCode};
 #[derive(Debug)]
 pub(crate) struct PeerGuard {
     peer: EndpointId,
+    /// Rejected connections: anyone can complete a direct handshake, so the warning is
+    /// logged once a minute and the rest counted (the connector summarises them).
+    rejected: Arc<Mutex<Tally>>,
 }
 
 impl PeerGuard {
-    pub(crate) fn new(peer: EndpointId) -> Self {
-        Self { peer }
+    pub(crate) fn new(peer: EndpointId, rejected: Arc<Mutex<Tally>>) -> Self {
+        Self { peer, rejected }
     }
 
     pub(crate) fn is_allowed(&self, remote: EndpointId, alpn: &[u8]) -> bool {
@@ -34,7 +41,8 @@ impl EndpointHooks for PeerGuard {
         if self.is_allowed(remote_addr.id, alpn) {
             BeforeConnectOutcome::Accept
         } else {
-            tracing::warn!(remote = %remote_addr.id.fmt_short(), "refusing to dial an endpoint that is not the link peer");
+            // The session only ever dials its peer: reaching this is a bug.
+            tracing::error!(remote = %remote_addr.id.fmt_short(), "refused to dial an endpoint that is not the link's peer");
             BeforeConnectOutcome::Reject
         }
     }
@@ -43,7 +51,17 @@ impl EndpointHooks for PeerGuard {
         if self.is_allowed(conn.remote_id(), conn.alpn()) {
             AfterHandshakeOutcome::accept()
         } else {
-            tracing::warn!(remote = %conn.remote_id().fmt_short(), "rejecting a connection from an endpoint that is not the link peer");
+            let first = self
+                .rejected
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .count(Instant::now());
+            let remote = conn.remote_id().fmt_short();
+            if first {
+                tracing::warn!(%remote, "rejected a connection from an endpoint that is not the link's peer (unauthorized); repeats are summarised every minute");
+            } else {
+                tracing::debug!(%remote, "rejected a connection from an endpoint that is not the link's peer (unauthorized)");
+            }
             AfterHandshakeOutcome::Reject {
                 error_code: CloseCode::Unauthorized.into(),
                 reason: b"unauthorized".to_vec(),
@@ -61,7 +79,7 @@ mod tests {
     fn only_the_link_peer_with_our_alpn_is_allowed() {
         let password = ConnectionPassword::from_bytes([7; 32]);
         let other_link = ConnectionPassword::from_bytes([8; 32]);
-        let guard = PeerGuard::new(password.endpoint_id(Role::Wallet));
+        let guard = PeerGuard::new(password.endpoint_id(Role::Wallet), Arc::default());
 
         assert!(guard.is_allowed(password.endpoint_id(Role::Wallet), ALPN));
         assert!(!guard.is_allowed(password.endpoint_id(Role::Connector), ALPN));

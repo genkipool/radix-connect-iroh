@@ -555,12 +555,12 @@ fn admission_keeps_the_wallet_and_strangers_in_separate_bounded_pools() {
     // the relay is a third party.
     assert_eq!(
         admission(&relay(wallet), true, wallet, peer_full),
-        Admission::Ignore
+        Admission::Ignore(Ignored::WalletPoolFull)
     );
     // Strangers via the relay never get handshake work.
     assert_eq!(
         admission(&relay(stranger), true, wallet, idle),
-        Admission::Ignore
+        Admission::Ignore(Ignored::Stranger)
     );
     // Direct attempts prove their source address first, then share the bounded pool,
     // which the wallet's attempts do not use up.
@@ -574,7 +574,7 @@ fn admission_keeps_the_wallet_and_strangers_in_separate_bounded_pools() {
     );
     assert_eq!(
         admission(&direct, true, wallet, direct_full),
-        Admission::Ignore
+        Admission::Ignore(Ignored::DirectPoolFull)
     );
 }
 
@@ -718,4 +718,1097 @@ async fn a_host_that_reads_late_gets_the_latest_state_not_a_backlog() {
     deliver(&connector, &wallet, "{\"still\":\"working\"}")
         .await
         .unwrap();
+}
+
+/// What hosts receive from the bindings, captured for the tests below.
+mod logs {
+    use std::fmt::{self, Write as _};
+    use std::sync::Mutex as StdMutex;
+
+    use tracing::field::{Field, Visit};
+    use tracing::{Event, Level, Metadata, Subscriber};
+    use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+    use tracing_subscriber::registry::LookupSpan;
+
+    use super::*;
+    use crate::logging::{
+        DiagnosticsLayer, format_event_with_context, host_log_enabled, needed_for_diagnostics,
+        redact_ip_addresses,
+    };
+
+    /// One captured event.
+    #[derive(Debug, Clone)]
+    pub(super) struct Line {
+        level: Level,
+        target: String,
+        /// As a host logging at `TRACE` receives it.
+        text: String,
+        /// The event's own text, unredacted.
+        raw: String,
+    }
+
+    /// Every event of the test process, as a host logging at `TRACE` gets them.
+    type Lines = Arc<StdMutex<Vec<Line>>>;
+
+    /// The lines captured since a test started. Tests run in parallel: the lines of a
+    /// test are told apart by its sessions' numbers (`session=…`).
+    #[derive(Debug, Clone)]
+    pub(super) struct Logs {
+        lines: Lines,
+        start: usize,
+    }
+
+    struct Capture(Lines);
+
+    impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
+        fn enabled(&self, metadata: &Metadata<'_>, _: Context<'_, S>) -> bool {
+            host_log_enabled(metadata.target(), *metadata.level(), Level::TRACE)
+                || needed_for_diagnostics(metadata)
+        }
+
+        fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
+            let metadata = event.metadata();
+            if !host_log_enabled(metadata.target(), *metadata.level(), Level::TRACE) {
+                return;
+            }
+            let mut raw = Raw::default();
+            event.record(&mut raw);
+            let line = Line {
+                level: *metadata.level(),
+                target: metadata.target().to_owned(),
+                text: format_event_with_context(event, &ctx),
+                raw: raw.0,
+            };
+            self.0.lock().unwrap().push(line);
+        }
+    }
+
+    #[derive(Default)]
+    struct Raw(String);
+
+    impl Visit for Raw {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    static LINES: std::sync::OnceLock<Lines> = std::sync::OnceLock::new();
+
+    /// Captures the process's events from now on, through the same layers the bindings
+    /// install, as the process's global subscriber (as the bindings do: per-thread
+    /// subscribers would miss callsites first registered on threads without one).
+    pub(super) fn capture() -> Logs {
+        let lines = LINES.get_or_init(|| {
+            let lines = Lines::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(DiagnosticsLayer)
+                .with(Capture(lines.clone()));
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            lines
+        });
+        // Callsites registered by other tests before the subscriber was installed.
+        tracing::callsite::rebuild_interest_cache();
+        let start = lines.lock().unwrap().len();
+        Logs {
+            lines: lines.clone(),
+            start,
+        }
+    }
+
+    impl Logs {
+        fn lines(&self) -> Vec<Line> {
+            self.lines
+                .lock()
+                .unwrap()
+                .get(self.start..)
+                .unwrap_or_default()
+                .to_vec()
+        }
+
+        fn find(&self, level: Level, needles: &[&str]) -> Option<Line> {
+            self.lines().into_iter().find(|line| {
+                line.level == level && needles.iter().all(|needle| line.text.contains(needle))
+            })
+        }
+
+        fn dump(&self, needles: &[&str]) -> String {
+            // The test's own sessions only.
+            let sessions: Vec<&str> = needles
+                .iter()
+                .copied()
+                .filter(|needle| needle.starts_with("session="))
+                .collect();
+            self.lines()
+                .iter()
+                .filter(|line| line.target.starts_with("radix_connect_iroh"))
+                .filter(|line| sessions.iter().all(|session| line.text.contains(session)))
+                .map(|line| format!("{} {}\n", line.level, line.text))
+                .collect()
+        }
+
+        /// The line at `level` that contains every needle.
+        pub(super) fn expect(&self, level: Level, needles: &[&str]) -> Line {
+            self.find(level, needles).unwrap_or_else(|| {
+                panic!(
+                    "no {level} line with {needles:?} among:\n{}",
+                    self.dump(needles)
+                )
+            })
+        }
+
+        /// How many lines at `level` contain every needle.
+        pub(super) fn count(&self, level: Level, needles: &[&str]) -> usize {
+            self.lines()
+                .iter()
+                .filter(|line| {
+                    line.level == level && needles.iter().all(|needle| line.text.contains(needle))
+                })
+                .count()
+        }
+
+        /// [`expect`](Self::expect), waiting for the line to come.
+        pub(super) async fn wait_for(&self, level: Level, needles: &[&str]) -> Line {
+            let found = time::timeout(WAIT, async {
+                loop {
+                    if let Some(line) = self.find(level, needles) {
+                        return line;
+                    }
+                    time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            found.unwrap_or_else(|_| self.expect(level, needles))
+        }
+
+        /// No line gives away the link's password or keys, a message body or an IP
+        /// address, and this crate's lines show endpoint ids in short form only.
+        pub(super) fn assert_clean(
+            &self,
+            link: &ConnectionPassword,
+            password: [u8; 32],
+            bodies: &[&str],
+        ) {
+            let mut secrets = vec![hex::encode(password)];
+            let mut full_ids = Vec::new();
+            for role in [Role::Wallet, Role::Connector] {
+                secrets.push(hex::encode(link.secret_key(role).to_bytes()));
+                full_ids.push(link.endpoint_id(role).to_string());
+            }
+            secrets.extend(bodies.iter().map(|body| (*body).to_owned()));
+            let lines = self.lines();
+            assert!(lines.len() > 10, "too few lines captured: {lines:?}");
+            for line in &lines {
+                for secret in &secrets {
+                    assert!(
+                        !line.raw.contains(secret.as_str()) && !line.text.contains(secret.as_str()),
+                        "a secret or a message body was logged: {line:?}"
+                    );
+                }
+                // What hosts receive never contains an IP address (the test relay is
+                // at 127.0.0.1, so that is what would show up).
+                assert!(!line.text.contains("127.0.0.1"), "{line:?}");
+                assert_eq!(redact_ip_addresses(&line.text), line.text, "{line:?}");
+                if line.target.starts_with("radix_connect_iroh") {
+                    // Not even redacted afterwards: this crate never logs one.
+                    assert_eq!(redact_ip_addresses(&line.raw), line.raw, "{line:?}");
+                    for id in &full_ids {
+                        assert!(
+                            !line.raw.contains(id.as_str()),
+                            "a full endpoint id: {line:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+use logs::capture;
+use tracing::Level;
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_follow_a_session_from_start_to_close() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(30);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    let request = r#"{"interactionId":"secret-body-1"}"#;
+    deliver(&connector, &wallet, request).await.unwrap();
+    // The connector's host takes the last message and closes at once: its confirmation
+    // still reaches the wallet.
+    let last = r#"{"interactionId":"secret-body-2"}"#;
+    let (sent, ()) = tokio::join!(wallet.send(last), async {
+        assert_eq!(next_message(&connector).await, last);
+        connector.close().await;
+    });
+    sent.unwrap();
+    wait_for_state(&wallet, ConnectionState::Connecting).await;
+    wallet.close().await;
+
+    let wallet_session = format!("session={} ", wallet.shared.session);
+    let connector_session = format!("session={} ", connector.shared.session);
+    for (session, role) in [
+        (&wallet_session, "role=wallet"),
+        (&connector_session, "role=connector"),
+    ] {
+        logs.expect(
+            Level::INFO,
+            &[
+                "session started",
+                session,
+                role,
+                "relays=https://<ip>:",
+                "ack_timeout_ms=",
+                "connect_timeout_ms=",
+            ],
+        );
+        logs.expect(
+            Level::INFO,
+            &[
+                "connected to the peer",
+                session,
+                "conn=1",
+                "path=relay",
+                "setup_ms=",
+            ],
+        );
+        logs.expect(
+            Level::INFO,
+            &["connectivity snapshot", session, "state=connected"],
+        );
+        logs.expect(Level::INFO, &["closing the session", session]);
+        logs.expect(
+            Level::INFO,
+            &[
+                "session closed",
+                session,
+                "lifetime_ms=",
+                "confirmations_flushed=true",
+            ],
+        );
+    }
+    logs.expect(
+        Level::INFO,
+        &["connected to the peer", &wallet_session, "attempt=1"],
+    );
+    // Both directions, with the message numbers of each side.
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "sending a message",
+            &connector_session,
+            "conn=1",
+            "send_seq=1",
+            "bytes=33",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "message transferred",
+            &connector_session,
+            "send_seq=1",
+            "transfer_ms=",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "message confirmed by the peer",
+            &connector_session,
+            "send_seq=1",
+            "confirm_ms=",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "receiving a message",
+            &wallet_session,
+            "recv_seq=1",
+            "announced_bytes=33",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "the host took a message",
+            &wallet_session,
+            "recv_seq=1",
+            "wait_ms=",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &["confirmation sent", &wallet_session, "recv_seq=1"],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "message confirmed by the peer",
+            &wallet_session,
+            "send_seq=1",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &["the host took a message", &connector_session, "recv_seq=1"],
+    );
+    // The wallet learns why the connection ended, how long it lasted and its traffic.
+    logs.expect(
+        Level::INFO,
+        &[
+            "disconnected from the peer",
+            &wallet_session,
+            "conn=1",
+            "reason=\"the peer closed the session\"",
+            "connected_ms=",
+            "sent_bytes=",
+            "lost_packets=",
+        ],
+    );
+    logs.expect(
+        Level::INFO,
+        &[
+            "disconnected from the peer",
+            &connector_session,
+            "reason=\"this session closed\"",
+        ],
+    );
+    logs.expect(Level::INFO, &["connected to the relay", &connector_session]);
+    logs.assert_clean(&link, [30; 32], &[request, last]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_explain_a_second_holder_of_the_wallet_key() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(31);
+    let (_connector, first) = connected_pair(&relay_url, &link).await;
+    time::timeout(WAIT, first.shared.endpoint.online())
+        .await
+        .unwrap();
+    assert!(!first.diagnostics().key_collision);
+
+    // Another device or app instance with the same link starts, on the same relay.
+    let second = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    time::timeout(WAIT, second.shared.endpoint.online())
+        .await
+        .unwrap();
+
+    // The relay tells the older wallet that it no longer receives anything.
+    let first_session = format!("session={} ", first.shared.session);
+    logs.wait_for(
+        Level::WARN,
+        &[
+            "another device or app instance with this link's key connected to the relay",
+            &first_session,
+            "relay=https://<ip>:",
+        ],
+    )
+    .await;
+    let snapshot = first.diagnostics();
+    assert!(snapshot.key_collision, "{snapshot}");
+    assert!(snapshot.to_string().contains("KEY COLLISION"), "{snapshot}");
+    logs.expect(
+        Level::INFO,
+        &["connectivity snapshot", &first_session, "KEY COLLISION"],
+    );
+    assert!(!second.diagnostics().key_collision);
+
+    // Once the newer one leaves, the relay delivers to the older one again.
+    second.close().await;
+    drop(second);
+    logs.wait_for(
+        Level::INFO,
+        &["the relay delivers to this end again", &first_session],
+    )
+    .await;
+    assert!(!first.diagnostics().key_collision);
+    logs.assert_clean(&link, [31; 32], &[]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_explain_a_replaced_connection_on_both_ends() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(36);
+    // A native connector, reachable directly too.
+    let connector = Session::start(&link, Role::Connector, config(&relay_url))
+        .await
+        .unwrap();
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+
+    // Another holder of the wallet key reaches the connector directly, without the
+    // relay (which would route the first wallet's traffic to it): the connector's
+    // first connection is alive when the second one arrives.
+    let other = Endpoint::builder(presets::Minimal)
+        .secret_key(link.secret_key(Role::Wallet))
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await
+        .unwrap();
+    let direct = connector
+        .shared
+        .endpoint
+        .bound_sockets()
+        .into_iter()
+        .filter(std::net::SocketAddr::is_ipv4)
+        .map(|addr| std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())));
+    let target =
+        EndpointAddr::new(connector.local_id()).with_addrs(direct.map(iroh::TransportAddr::Ip));
+    let _replacement = time::timeout(WAIT, other.connect(target, ALPN))
+        .await
+        .unwrap()
+        .unwrap();
+
+    let connector_session = format!("session={} ", connector.shared.session);
+    logs.wait_for(
+        Level::INFO,
+        &[
+            "a new connection from the wallet replaced the current one",
+            &connector_session,
+            "replaced_conn=1",
+            "conn=2",
+            "replaced_after_ms=",
+        ],
+    )
+    .await;
+    logs.expect(
+        Level::INFO,
+        &[
+            "disconnected from the peer",
+            &connector_session,
+            "conn=1",
+            "reason=\"replaced by a newer connection from the wallet\"",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "an incoming handshake started",
+            &connector_session,
+            "origin=direct",
+        ],
+    );
+    // The first wallet hears it through the relay, and backs off.
+    let wallet_session = format!("session={} ", wallet.shared.session);
+    logs.wait_for(
+        Level::WARN,
+        &[
+            "another session holding this link's wallet key",
+            &wallet_session,
+            "replaced_in_a_row=1",
+            "delay_ms=500",
+        ],
+    )
+    .await;
+    logs.expect(
+        Level::INFO,
+        &[
+            "disconnected from the peer",
+            &wallet_session,
+            "conn=1",
+            "reason=\"the connector accepted a newer connection with this link's wallet key\"",
+        ],
+    );
+    other.close().await;
+    logs.assert_clean(&link, [36; 32], &[]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_explain_a_slow_host_a_timeout_and_a_withdrawal() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(32);
+    let mut connector_config = relay_only(&relay_url);
+    connector_config.host_slow_after = Duration::from_millis(200);
+    let connector = Session::start(&link, Role::Connector, connector_config)
+        .await
+        .unwrap();
+    let wallet_config = config(&relay_url).with_ack_timeout(Duration::from_millis(1000));
+    let wallet = Session::start(&link, Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+
+    // The connector's host does not read: the wallet's send times out waiting for the
+    // confirmation, and the connector withdraws the message.
+    let late = r#"{"secret-body":"late"}"#;
+    assert_eq!(wallet.send(late).await, Err(SendError::Timeout));
+    let wallet_session = format!("session={} ", wallet.shared.session);
+    let connector_session = format!("session={} ", connector.shared.session);
+    logs.expect(
+        Level::WARN,
+        &[
+            "could not send a message to the peer",
+            &wallet_session,
+            "send_seq=1",
+            "outcome=timeout",
+            "phase=confirmation",
+            "timeout_ms=1000",
+            "elapsed_ms=",
+        ],
+    );
+    logs.expect(
+        Level::WARN,
+        &[
+            "the host has not taken a message yet",
+            &connector_session,
+            "recv_seq=1",
+            "threshold_ms=200",
+            "waited_ms=",
+        ],
+    );
+    logs.wait_for(
+        Level::INFO,
+        &[
+            "withdrew a message the host had not taken",
+            &connector_session,
+            "recv_seq=1",
+        ],
+    )
+    .await;
+
+    // A slow host that takes the message in the end gets it confirmed.
+    let slow = r#"{"secret-body":"slow"}"#;
+    let (sent, ()) = tokio::join!(wallet.send(slow), async {
+        time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(next_message(&connector).await, slow);
+    });
+    sent.unwrap();
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "skipped a withdrawn message",
+            &connector_session,
+            "recv_seq=1",
+        ],
+    );
+    logs.expect(
+        Level::WARN,
+        &[
+            "the host has not taken a message yet",
+            &connector_session,
+            "recv_seq=2",
+        ],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &["the host took a message", &connector_session, "recv_seq=2"],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "message confirmed by the peer",
+            &wallet_session,
+            "send_seq=2",
+        ],
+    );
+    logs.assert_clean(&link, [32; 32], &[late, slow]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_explain_refused_and_cancelled_messages() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(33);
+    let connector = Session::start(
+        &link,
+        Role::Connector,
+        relay_only(&relay_url).with_max_message_size(1024),
+    )
+    .await
+    .unwrap();
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    let wallet_session = format!("session={} ", wallet.shared.session);
+    let connector_session = format!("session={} ", connector.shared.session);
+
+    // Refused by the connector, which accepts up to 1 KiB.
+    let large = format!("{{\"secret-body\":\"{}\"}}", "x".repeat(4096));
+    assert_eq!(wallet.send(&large).await, Err(SendError::Rejected));
+    logs.expect(
+        Level::WARN,
+        &[
+            "refused an incoming message over the size limit",
+            &connector_session,
+            "recv_seq=1",
+            "max_bytes=1024",
+            "announced_bytes=4114",
+        ],
+    );
+    logs.expect(
+        Level::WARN,
+        &[
+            "could not send a message to the peer",
+            &wallet_session,
+            "send_seq=1",
+            "outcome=rejected",
+            "phase=",
+        ],
+    );
+    // Refused locally, before anything is sent.
+    assert!(matches!(
+        connector.send(&large).await,
+        Err(SendError::MessageTooLarge { .. })
+    ));
+    logs.expect(
+        Level::WARN,
+        &[
+            "could not send a message to the peer",
+            &connector_session,
+            "outcome=too_large",
+            "bytes=4114",
+        ],
+    );
+    // Not connected: the host falls back to WebRTC, nothing worth more than a debug line.
+    let stranger = Session::start(&password(34), Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    assert_eq!(stranger.send("{}").await, Err(SendError::NotConnected));
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "send refused: not connected to the peer",
+            &format!("session={} ", stranger.shared.session),
+        ],
+    );
+
+    // A send the host abandons is reset, never finished.
+    let big = "y".repeat(4 * 1024 * 1024);
+    let wallet_without_limit = &wallet;
+    let cut = time::timeout(Duration::from_millis(5), wallet_without_limit.send(&big)).await;
+    assert!(cut.is_err());
+    logs.expect(
+        Level::DEBUG,
+        &["the host cancelled the send", &wallet_session, "send_seq=2"],
+    );
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "reset a stream abandoned before it was finished",
+            &wallet_session,
+            "send_seq=2",
+            "stream=message",
+        ],
+    );
+    logs.assert_clean(&link, [33; 32], &[&large, &big]);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn the_logs_explain_why_the_wallet_cannot_connect() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(35);
+    let mut wallet_config = config(&relay_url);
+    wallet_config.connect_timeout = Duration::from_millis(300);
+    // Long waits between attempts: only a network change makes it dial again soon.
+    wallet_config.min_reconnect_delay = Duration::from_secs(30);
+    wallet_config.max_reconnect_delay = Duration::from_secs(30);
+    // Nobody listens for this link.
+    let wallet = Session::start(&link, Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+    let session = format!("session={} ", wallet.shared.session);
+    // The first attempt may fail before the wallet's relay is up (`relay_unreachable`).
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "dial attempt failed",
+            &session,
+            "attempt=1",
+            "outcome=",
+            "timeout_ms=300",
+            "relay_connected=",
+            "peer_relay=https://<ip>:",
+        ],
+    )
+    .await;
+    logs.expect(
+        Level::DEBUG,
+        &[
+            "dialing the connector",
+            &session,
+            "attempt=1",
+            "reason=first",
+        ],
+    );
+    logs.expect(
+        Level::INFO,
+        &[
+            "still trying to reach the connector",
+            &session,
+            "failed_attempts=1",
+            "last_outcome=",
+            "hint=",
+        ],
+    );
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "waiting before dialing again",
+            &session,
+            "delay_ms=30000",
+            "reason=retry",
+        ],
+    )
+    .await;
+
+    // A network change cuts the wait short; with its relay up, only the connector is
+    // missing.
+    time::timeout(WAIT, wallet.shared.endpoint.online())
+        .await
+        .unwrap();
+    wallet.network_changed().await;
+    logs.expect(
+        Level::INFO,
+        &[
+            "the host reported a network change",
+            &session,
+            "state=connecting",
+        ],
+    );
+    logs.wait_for(
+        Level::INFO,
+        &[
+            "the network changed: dialing again now instead of waiting",
+            &session,
+            "planned_delay_ms=30000",
+        ],
+    )
+    .await;
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "dialing the connector",
+            &session,
+            "attempt=2",
+            "reason=network_changed",
+        ],
+    )
+    .await;
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "dial attempt failed",
+            &session,
+            "attempt=2",
+            "outcome=timeout",
+            "relay_connected=true",
+        ],
+    )
+    .await;
+    logs.expect(
+        Level::INFO,
+        &[
+            "still trying to reach the connector",
+            &session,
+            "failed_attempts=2",
+            "last_outcome=timeout",
+            "hint=\"is the connector running",
+        ],
+    );
+    let snapshot = wallet.diagnostics();
+    assert!(
+        snapshot
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("is the connector running")),
+        "{snapshot}"
+    );
+    drop(wallet);
+    logs.expect(
+        Level::INFO,
+        &["session dropped without being closed", &session],
+    );
+    logs.assert_clean(&link, [35; 32], &[]);
+}
+
+#[test]
+fn liveness_checks_wait_three_round_trips_within_bounds() {
+    use crate::PathKind::{Direct, Relay};
+    assert_eq!(probe_deadline(None, Some(Relay), true), PROBE_MIN_DEADLINE);
+    assert_eq!(
+        probe_deadline(Some(Duration::from_millis(100)), Some(Relay), true),
+        PROBE_MIN_DEADLINE
+    );
+    assert_eq!(
+        probe_deadline(Some(Duration::from_millis(800)), Some(Direct), false),
+        Duration::from_millis(2400)
+    );
+    assert_eq!(
+        probe_deadline(Some(Duration::from_secs(5)), Some(Relay), true),
+        PROBE_MAX_DEADLINE
+    );
+    // Packets wait for a relay that is reconnecting.
+    assert_eq!(
+        probe_deadline(Some(Duration::from_millis(10)), Some(Relay), false),
+        PROBE_MAX_DEADLINE
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_liveness_check_is_answered_both_ways_and_is_no_error() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(37);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    let wallet_session = format!("session={} ", wallet.shared.session);
+    let connector_session = format!("session={} ", connector.shared.session);
+
+    wallet.network_changed().await;
+    logs.wait_for(
+        Level::INFO,
+        &[
+            "the peer answered the liveness check",
+            &wallet_session,
+            "answer_ms=",
+            "rtt_ms=",
+        ],
+    )
+    .await;
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "answered a liveness check from the peer",
+            &connector_session,
+        ],
+    )
+    .await;
+    // Two more reports moments later share one more check, once the first is old enough.
+    wallet.network_changed().await;
+    wallet.network_changed().await;
+    logs.wait_for(
+        Level::DEBUG,
+        &["a liveness check ran moments ago", &wallet_session],
+    )
+    .await;
+    connector.network_changed().await;
+    logs.wait_for(
+        Level::INFO,
+        &["the peer answered the liveness check", &connector_session],
+    )
+    .await;
+    logs.wait_for(
+        Level::DEBUG,
+        &["answered a liveness check from the peer", &wallet_session],
+    )
+    .await;
+    time::sleep(PROBE_DEBOUNCE + Duration::from_millis(500)).await;
+    let checks = &[
+        "checking that the peer still answers",
+        &wallet_session,
+        "why=network_changed",
+        "deadline_ms=",
+    ];
+    assert_eq!(logs.count(Level::INFO, checks), 2);
+    assert_eq!(
+        logs.count(
+            Level::INFO,
+            &["the peer answered the liveness check", &wallet_session]
+        ),
+        2
+    );
+
+    // Nothing went wrong on either side, and the link keeps working.
+    for session in [&connector, &wallet] {
+        let snapshot = session.diagnostics();
+        assert_eq!(snapshot.state, ConnectionState::Connected, "{snapshot}");
+        assert_eq!(snapshot.last_error, None, "{snapshot}");
+    }
+    deliver(&wallet, &connector, "{\"after\":\"probe\"}")
+        .await
+        .unwrap();
+    deliver(&connector, &wallet, "{\"after\":\"probe\"}")
+        .await
+        .unwrap();
+    logs.assert_clean(&link, [37; 32], &[]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dead_connection_is_dropped_within_seconds_of_a_network_change() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    for (byte, survivor_role) in [(38, Role::Wallet), (39, Role::Connector)] {
+        let link = password(byte);
+        let (connector, wallet) = connected_pair(&relay_url, &link).await;
+        let (survivor, vanished, after) = match survivor_role {
+            Role::Wallet => (wallet, connector, ConnectionState::Connecting),
+            Role::Connector => (connector, wallet, ConnectionState::Disconnected),
+        };
+        // The peer's process freezes or dies without a word (no close): its connection
+        // just goes quiet. QUIC alone would notice after its 30 s idle timeout.
+        drop(vanished);
+        let started = time::Instant::now();
+        survivor.network_changed().await;
+        let session = format!("session={} ", survivor.shared.session);
+        // The longest liveness deadline, and some slack.
+        let soon = PROBE_MAX_DEADLINE + Duration::from_secs(2);
+        if time::timeout(soon, wait_for_state(&survivor, after))
+            .await
+            .is_err()
+        {
+            // Shows what the session logged.
+            logs.expect(
+                Level::WARN,
+                &["the peer did not answer the liveness check", &session],
+            );
+            panic!("{session}still believes it is connected");
+        }
+        assert!(started.elapsed() < soon, "{:?}", started.elapsed());
+        logs.expect(
+            Level::WARN,
+            &[
+                "the peer did not answer the liveness check",
+                &session,
+                "deadline_ms=",
+                "elapsed_ms=",
+            ],
+        );
+        logs.expect(
+            Level::INFO,
+            &[
+                "disconnected from the peer",
+                &session,
+                "reason=\"no answer to a liveness check\"",
+            ],
+        );
+        if survivor_role == Role::Wallet {
+            // The wallet redials at once rather than after a back-off.
+            logs.wait_for(
+                Level::DEBUG,
+                &[
+                    "waiting before dialing again",
+                    &session,
+                    "delay_ms=0",
+                    "reason=unresponsive",
+                ],
+            )
+            .await;
+            logs.wait_for(
+                Level::DEBUG,
+                &[
+                    "dialing the connector",
+                    &session,
+                    "attempt=1",
+                    "reason=unresponsive",
+                ],
+            )
+            .await;
+        }
+        logs.assert_clean(&link, [byte; 32], &[]);
+    }
+}
+
+/// When the wallet dials while the connector stays unreachable, each attempt failing
+/// after `attempt`: the start times of its attempts, in seconds, within `horizon`.
+fn attempt_times(config: &SessionConfig, attempt: Duration, horizon: Duration) -> Vec<f64> {
+    let start = time::Instant::now();
+    let mut retry = Retry::new(start, config);
+    let mut at = Duration::ZERO;
+    let mut times = Vec::new();
+    while at < horizon {
+        times.push(at.as_secs_f64());
+        at += attempt;
+        let (delay, _) = retry.after_failure(start + at, config);
+        at += delay;
+    }
+    times
+}
+
+#[test]
+fn the_wallet_retries_quickly_for_two_minutes_then_every_30_seconds() {
+    let config = SessionConfig::public();
+    // Attempts time out after 10 s (the connector is offline, its relay known).
+    let times = attempt_times(&config, config.connect_timeout, Duration::from_secs(300));
+    assert_eq!(
+        times,
+        [
+            0.0, 10.5, 21.5, 33.5, 47.5, 62.5, 77.5, 92.5, 107.5, 122.5, // quick
+            162.5, 202.5, 242.5, 282.5, // then one every 30 s after the 10 s attempt
+        ]
+    );
+    // A connector that comes online waits at most one attempt and one delay.
+    let gaps: Vec<f64> = times.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    assert!(gaps[..9].iter().all(|gap| *gap <= 15.0), "{gaps:?}");
+    assert!(gaps[9..].iter().all(|gap| *gap <= 40.0), "{gaps:?}");
+
+    // Attempts that fail at once (no address published) are spaced by the delays alone.
+    let times = attempt_times(
+        &config,
+        Duration::from_millis(100),
+        Duration::from_secs(200),
+    );
+    let slow = times.iter().position(|at| *at > 120.0).unwrap();
+    assert!(
+        (times[slow + 1] - times[slow] - 30.1).abs() < 1e-9,
+        "{times:?}"
+    );
+    assert!(times.len() < 40, "{} attempts in 200 s", times.len());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(40);
+    let mut wallet_config = config(&relay_url);
+    wallet_config.connect_timeout = Duration::from_millis(300);
+    wallet_config.fast_retry_period = Duration::from_millis(500);
+    wallet_config.slow_reconnect_delay = Duration::from_secs(120);
+    let wallet = Session::start(&link, Role::Wallet, wallet_config)
+        .await
+        .unwrap();
+    let session = format!("session={} ", wallet.shared.session);
+    // Nobody listens: after the quick period the wallet waits long between attempts.
+    logs.wait_for(
+        Level::INFO,
+        &[
+            "the connector is still unreachable: retrying less often",
+            &session,
+            "delay_ms=120000",
+        ],
+    )
+    .await;
+    logs.wait_for(
+        Level::DEBUG,
+        &["waiting before dialing again", &session, "delay_ms=120000"],
+    )
+    .await;
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    time::timeout(WAIT, connector.shared.endpoint.online())
+        .await
+        .unwrap();
+    time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(wallet.state(), ConnectionState::Connecting);
+
+    // The app returns to the foreground: the wallet dials at once.
+    let woke = time::Instant::now();
+    wallet.network_changed().await;
+    time::timeout(Duration::from_secs(10), async {
+        while wallet.state() != ConnectionState::Connected {
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the wallet did not dial at once after the wake-up");
+    assert!(woke.elapsed() < Duration::from_secs(10));
+    logs.expect(
+        Level::DEBUG,
+        &["dialing the connector", &session, "reason=network_changed"],
+    );
+    logs.assert_clean(&link, [40; 32], &[]);
 }

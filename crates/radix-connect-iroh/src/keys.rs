@@ -103,6 +103,14 @@ impl Role {
         }
     }
 
+    /// `wallet` or `connector`, for logs.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Wallet => "wallet",
+            Self::Connector => "connector",
+        }
+    }
+
     fn key_context(self) -> &'static str {
         match self {
             Self::Wallet => WALLET_KEY_CONTEXT,
