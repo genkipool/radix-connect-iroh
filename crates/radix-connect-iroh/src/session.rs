@@ -227,7 +227,7 @@ struct Shared {
     /// Wallet: whether its app is in the background, as the host said; told to the connector
     /// on every connection.
     in_background: AtomicBool,
-    /// Connector: whether the wallet said its app is in the background, on this connection.
+    /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
 }
 
@@ -450,9 +450,9 @@ impl Session {
         }
     }
 
-    /// Connector: whether the wallet said its app is in the background, on the current
-    /// connection. `false` when it said nothing (a wallet that predates this), or once it is
-    /// back in the foreground.
+    /// Connector: whether the wallet last said its app is in the background (it says so on
+    /// every connection). `false` when it never said (a wallet that predates this), or once it
+    /// is back in the foreground.
     pub fn peer_in_background(&self) -> bool {
         self.shared.peer_in_background.load(Ordering::Relaxed)
     }
@@ -1821,8 +1821,10 @@ async fn accept(shared: &Arc<Shared>) -> Option<Serving> {
                 }
                 let current = shared.current(connection.clone());
                 shared.connection.send_replace(Some(current.clone()));
-                // Until the wallet says otherwise (one that predates presence never does).
-                shared.peer_in_background.store(false, Ordering::Relaxed);
+                // The wallet's presence is not reset here: it says it again on this connection,
+                // and resetting it opened a moment, between this line and its datagram, in
+                // which a wallet in the background read as in the foreground. One that predates
+                // presence never said anything, and reads as in the foreground still.
                 // Replacing the task stops serving the previous connection.
                 if let Some(Serving { current: previous, .. }) = serving.take() {
                     previous.connection.close(CloseCode::Replaced.into(), b"replaced");
