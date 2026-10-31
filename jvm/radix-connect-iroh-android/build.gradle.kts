@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "com.radixdlt.connect"
-version = "0.1.1"
+version = "0.1.2"
 
 val rustWorkspace: File = rootDir.parentFile
 val generatedJniLibs = layout.buildDirectory.dir("generated/jniLibs")

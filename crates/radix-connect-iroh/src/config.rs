@@ -75,12 +75,18 @@ pub struct SessionConfig {
     pub(crate) fast_retry_period: Duration,
     pub(crate) slow_reconnect_delay: Duration,
     pub(crate) host_slow_after: Duration,
+    /// The relay the peer was last seen on (a connector's hint for its wallet): see
+    /// [`SessionConfig::with_peer_relay`].
+    pub(crate) peer_relay: Option<RelayUrl>,
     /// Tests run a relay with a self-signed certificate.
     #[cfg(test)]
     pub(crate) insecure_skip_relay_cert_verify: bool,
     /// Tests use it to reproduce the browser, where only the relay is reachable.
     #[cfg(test)]
     pub(crate) relay_only: bool,
+    /// Tests use it to reproduce a connector that predates knocks.
+    #[cfg(test)]
+    pub(crate) no_knock: bool,
     /// Tests run [`Relays::Public`] against a local relay and pkarr server.
     #[cfg(test)]
     pub(crate) test_public_infrastructure: Option<TestPublicInfrastructure>,
@@ -137,10 +143,13 @@ impl SessionConfig {
             fast_retry_period: DEFAULT_FAST_RETRY_PERIOD,
             slow_reconnect_delay: DEFAULT_SLOW_RECONNECT_DELAY,
             host_slow_after: DEFAULT_HOST_SLOW_AFTER,
+            peer_relay: None,
             #[cfg(test)]
             insecure_skip_relay_cert_verify: false,
             #[cfg(test)]
             relay_only: false,
+            #[cfg(test)]
+            no_knock: false,
             #[cfg(test)]
             test_public_infrastructure: None,
         }
@@ -159,9 +168,32 @@ impl SessionConfig {
         self
     }
 
+    /// The relay the peer was last seen on, for a connector: as soon as its session starts it
+    /// knocks there, and a wallet that is up dials it at once instead of at its next retry (up
+    /// to 30 s later once it has been waiting a while). Get it from
+    /// [`Session::peer_relay`](crate::Session::peer_relay) while connected, and keep it with
+    /// the link. With a custom relay the peer is on that one, and this is not needed. A wrong
+    /// or old relay only means the knock does not arrive; nothing else changes.
+    pub fn with_peer_relay(mut self, relay_url: &str) -> Result<Self, Error> {
+        self.peer_relay = Some(parse_relay_url(relay_url)?);
+        Ok(self)
+    }
+
     /// The relays this session uses.
     pub fn relays(&self) -> &Relays {
         &self.relays
+    }
+
+    /// Where a connector knocks for its wallet: the custom relay, or the peer's relay hint.
+    pub(crate) fn knock_relay(&self) -> Option<&RelayUrl> {
+        #[cfg(test)]
+        if self.no_knock {
+            return None;
+        }
+        match &self.relays {
+            Relays::Custom(url) => Some(url),
+            Relays::Public => self.peer_relay.as_ref(),
+        }
     }
 }
 

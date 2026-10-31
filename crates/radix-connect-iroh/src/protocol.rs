@@ -31,6 +31,11 @@ use crate::logging::Redacted;
 /// ALPN of version 1 of this protocol.
 pub const ALPN: &[u8] = b"radix-connect/iroh/1";
 
+/// ALPN of a knock: a connector that just started tells its wallet, which dials it at once.
+/// Nothing travels over it: the wallet closes it with [`CloseCode::Knocked`] as soon as the
+/// handshake (which proves the connector's key) is done. A wallet that predates it refuses it.
+pub const KNOCK_ALPN: &[u8] = b"radix-connect/iroh/knock/1";
+
 /// Status byte: the message was received and taken by the application.
 const STATUS_RECEIVED: u8 = 0x00;
 /// Status byte: the message was refused (too large, malformed or not UTF-8).
@@ -50,6 +55,8 @@ pub(crate) enum CloseCode {
     Replaced = 2,
     /// The peer did not answer a liveness check: the connection is presumed dead.
     Unresponsive = 3,
+    /// A knock, taken: the wallet dials the connector now.
+    Knocked = 4,
 }
 
 impl From<CloseCode> for VarInt {

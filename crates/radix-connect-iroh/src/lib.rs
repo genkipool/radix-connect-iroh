@@ -60,5 +60,5 @@ pub use diagnostics::{Diagnostics, PathKind};
 pub use error::{Error, SendError};
 pub use iroh::EndpointId;
 pub use keys::{ConnectionPassword, Role};
-pub use protocol::ALPN;
+pub use protocol::{ALPN, KNOCK_ALPN};
 pub use session::{ConnectionState, Session, SessionEvent};

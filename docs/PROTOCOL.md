@@ -80,7 +80,7 @@ Test vector — `P = cafe…cafe` (the two bytes `ca fe` repeated 16 times):
 Both sides install a hook that runs inside iroh for every connection:
 
 - before dialing: refuse any target other than the derived peer id or any ALPN other
-  than `radix-connect/iroh/1`;
+  than `radix-connect/iroh/1` and `radix-connect/iroh/knock/1` (§7.1);
 - after the handshake: close with application error `1` (`unauthorized`) any
   connection whose authenticated remote id is not the derived peer id.
 
@@ -100,7 +100,8 @@ Before any handshake work, the connector screens connection attempts:
   and the hook then rejects it. Filling that pool never keeps the wallet out, since its
   attempts through the relay use their own pool.
 
-The wallet's endpoint registers no ALPN and drops every incoming attempt unanswered.
+The wallet's endpoint registers one ALPN, `radix-connect/iroh/knock/1`, for its connector's
+knocks (§7.1), and accepts nothing that carries messages.
 
 When an authenticated connection arrives while another one is active, the new one wins
 and the old one is closed with application error `2` (`replaced`): the wallet only
@@ -211,7 +212,31 @@ States: `connecting` (wallet dialing), `connected`, `disconnected`.
 
 Application error codes when closing a connection: `0` closed by its owner, `1`
 unauthorized (§5), `2` replaced by a newer connection (§5), `3` unresponsive (no answer
-to a liveness check). Peers describe codes they do not know generically.
+to a liveness check), `4` knocked (§7.1). Peers describe codes they do not know
+generically.
+
+### 7.1 Knocks (since 0.1.2)
+
+Only the wallet dials, so a connector that comes online waits for the wallet's next
+attempt — up to about 40 s once the wallet has been waiting a while. A **knock** cuts that
+short: when its session starts, a connector that knows where its wallet is — the custom
+relay, or the relay the wallet was last seen on (`peer_relay()`, kept by the host with the
+link and given back as a hint) — connects to the wallet's endpoint id there with ALPN
+`radix-connect/iroh/knock/1`, at once and again after 2 s and 6 s while it is not connected.
+
+- The wallet completes the handshake (which proves the connector's key; the admission hook
+  turns anybody else away with error `1`), closes the connection at once with application
+  error `4` (`knocked`), and treats it as a wake-up: a waiting dial goes now and the quick
+  period starts again. Nothing travels over a knock.
+- A knock while the wallet is connected does nothing: a connection left over from a
+  connector process that ended does not linger, as the new process, holding the same key,
+  answers its packets with a QUIC reset. Knocks within 2 s of the last one that woke the
+  wallet wake it once; at most 4 knock handshakes are in progress at once.
+- A wallet that predates knocks registers no ALPN and refuses the handshake; a connector
+  that predates them never knocks. Either way the link works as before.
+- On n0's public relays the wallet publishes no address (§4): the connector can only knock
+  at a relay it remembers, which costs the phone nothing and publishes nothing new. A
+  wrong or outdated relay only means the knock does not arrive.
 
 ## 8. Security considerations
 

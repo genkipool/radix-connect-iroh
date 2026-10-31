@@ -27,7 +27,8 @@ use crate::diagnostics::{
 use crate::guard::PeerGuard;
 use crate::logging::Redacted;
 use crate::protocol::{
-    self, ALPN, Acknowledged, CloseCode, Incoming, Liveness, SendFailure, SendPhase, Sent,
+    self, ALPN, Acknowledged, CloseCode, Incoming, KNOCK_ALPN, Liveness, SendFailure, SendPhase,
+    Sent,
 };
 use crate::relay_health::{self, RelayNotice};
 use crate::{ConnectionPassword, Error, Role, SendError, SessionConfig};
@@ -206,6 +207,9 @@ struct Shared {
     /// Bumped on every network change: a change made while the wallet waits to dial
     /// again cuts the wait short.
     network: watch::Sender<u64>,
+    /// Wallet: bumped on every knock it took (a wake-up too, which also bumps `network`),
+    /// so the dial loop can say why it dials now.
+    knocks: watch::Sender<u64>,
     /// Confirmations owed to the peer: for messages the host took, until they are
     /// written and acknowledged. Closing waits for them briefly so that a message the
     /// host took is not reported as lost.
@@ -261,11 +265,11 @@ impl Session {
             // The protocol uses no datagrams: don't buffer any.
             .datagram_receive_buffer_size(None)
             .build();
-        // Only the Connector Extension accepts connections: an endpoint without ALPNs
-        // refuses every incoming handshake.
+        // The connector accepts the wallet's connections; the wallet accepts only knocks
+        // (its connector telling it to dial now), and no connection that carries anything.
         let alpns = match role {
             Role::Connector => vec![ALPN.to_vec()],
-            Role::Wallet => Vec::new(),
+            Role::Wallet => vec![KNOCK_ALPN.to_vec()],
         };
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(password.secret_key(role))
@@ -323,6 +327,7 @@ impl Session {
             stopped: watch::Sender::new(false),
             messages: messages_tx,
             network: watch::Sender::new(0),
+            knocks: watch::Sender::new(0),
             acks_in_flight: Arc::new(watch::Sender::new(0)),
             trouble: std::sync::Mutex::default(),
             connections: AtomicU64::new(0),
@@ -399,6 +404,29 @@ impl Session {
 
     /// A snapshot of the session's connectivity, for logs (its `Display` is one line)
     /// and diagnostics screens. Cheap; contains no secrets.
+    /// The relay the peer is on, as this end knows it (best while connected). A connector
+    /// keeps its wallet's as the link's relay hint, for [`SessionConfig::with_peer_relay`]:
+    /// the next session knocks there.
+    pub async fn peer_relay(&self) -> Option<RelayUrl> {
+        let info = self.shared.endpoint.remote_info(self.shared.peer).await?;
+        info.addrs().find_map(|addr| match addr.addr() {
+            TransportAddr::Relay(url) => Some(url.clone()),
+            _ => None,
+        })
+    }
+
+    /// Connector: knocks for the wallet at `relay` now — a wallet that is up dials at once.
+    /// Whether it took the knock (a wallet that predates knocks, or is not up, does not).
+    /// Sessions knock by themselves when they start; this is for a host that knows better.
+    pub async fn knock(&self, relay: &RelayUrl) -> bool {
+        if self.shared.role != Role::Connector {
+            return false;
+        }
+        knock(&self.shared, relay)
+            .instrument(self.shared.span.clone())
+            .await
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.shared.diagnostics()
     }
@@ -928,14 +956,18 @@ async fn drive(shared: Arc<Shared>) {
         match shared.role {
             Role::Wallet => {
                 // `dial` returns once the session closes, after confirming a message its
-                // host already took; `ignore_incoming` only when the endpoint is gone.
+                // host already took; `answer_knocks` only when the endpoint is gone.
                 tokio::select! {
                     () = dial(&shared) => {}
-                    () = ignore_incoming(&shared) => {}
+                    () = answer_knocks(&shared) => {}
                 }
                 None
             }
-            Role::Connector => accept(&shared).await,
+            Role::Connector => {
+                // Side by side: the knocks end within seconds, the session is the accept loop.
+                let (serving, ()) = tokio::join!(accept(&shared), knock_on_start(&shared));
+                serving
+            }
         }
     };
     let serving = tokio::select! {
@@ -962,6 +994,8 @@ enum DialReason {
     Unresponsive,
     /// The network changed while the wallet waited (or dialed).
     NetworkChanged,
+    /// The connector knocked: it is up, and waits for the wallet.
+    Knocked,
 }
 
 impl DialReason {
@@ -973,6 +1007,7 @@ impl DialReason {
             Self::Replaced => "replaced",
             Self::Unresponsive => "unresponsive",
             Self::NetworkChanged => "network_changed",
+            Self::Knocked => "knocked",
         }
     }
 }
@@ -987,6 +1022,7 @@ async fn dial(shared: &Arc<Shared>) {
     };
     let config = &shared.config;
     let mut network = shared.network.subscribe();
+    let mut knocks = shared.knocks.subscribe();
     let mut retry = Retry::new(shared.started_at, config);
     let mut delay = config.min_reconnect_delay;
     let mut replaced_in_a_row = 0;
@@ -1148,12 +1184,23 @@ async fn dial(shared: &Arc<Shared>) {
             biased;
             () = shared.wait_closed() => return,
             Ok(()) = network.changed(), if follow_network => {
-                tracing::info!(
-                    waited_ms = ms(waiting.elapsed()),
-                    planned_delay_ms = ms(delay),
-                    "the network changed: dialing again now instead of waiting, and quickly again for a while"
-                );
-                reason = DialReason::NetworkChanged;
+                let knocked = knocks.has_changed().unwrap_or(false);
+                knocks.mark_unchanged();
+                if knocked {
+                    tracing::info!(
+                        waited_ms = ms(waiting.elapsed()),
+                        planned_delay_ms = ms(delay),
+                        "the connector knocked: dialing it now instead of waiting, and quickly again for a while"
+                    );
+                    reason = DialReason::Knocked;
+                } else {
+                    tracing::info!(
+                        waited_ms = ms(waiting.elapsed()),
+                        planned_delay_ms = ms(delay),
+                        "the network changed: dialing again now instead of waiting, and quickly again for a while"
+                    );
+                    reason = DialReason::NetworkChanged;
+                }
                 // A wake-up: the connector may be back, retry quickly again.
                 retry = Retry::new(Instant::now(), config);
             }
@@ -1341,36 +1388,139 @@ impl RelayLog {
     }
 }
 
-/// Wallet: drop every incoming connection attempt without answering. The endpoint has
-/// no ALPN, so none could succeed, but unaccepted attempts would pile up in memory.
-/// Returns only once the endpoint is closed.
-async fn ignore_incoming(shared: &Shared) {
+/// How many knocks a wallet takes at once: a knock is one handshake, and nothing else.
+const KNOCKS_IN_FLIGHT: usize = 4;
+/// How long a knock's handshake may take.
+const KNOCK_TIMEOUT: Duration = Duration::from_secs(5);
+/// Knocks closer together than this wake the wallet once: even its own connector cannot keep
+/// it dialing.
+const KNOCK_MIN_GAP: Duration = Duration::from_secs(2);
+/// When a connector knocks after its session starts, while its wallet is not connected.
+const KNOCKS_AT: [Duration; 3] = [
+    Duration::ZERO,
+    Duration::from_secs(2),
+    Duration::from_secs(6),
+];
+
+/// Wallet: takes the knocks of its connector — a connector that just started — and dials at
+/// once instead of at its next retry. A knock carries nothing: the handshake proves the
+/// connector's key (the guard turns away anybody else, as for every connection), and the
+/// wallet closes it right after. Anything else is ignored, as before.
+async fn answer_knocks(shared: &Shared) {
     let mut ignored = Tally::default();
+    let mut handshakes = FuturesUnordered::new();
+    let mut last_wake: Option<Instant> = None;
     loop {
         let summary_at = ignored.ends_at();
-        let incoming = tokio::select! {
+        tokio::select! {
             biased;
             () = time::sleep_until(summary_at.unwrap_or_else(Instant::now)), if summary_at.is_some() => {
                 if let Some(count) = ignored.take_if_over(Instant::now()) {
                     tracing::info!(
                         count,
                         window_s = TALLY_WINDOW.as_secs(),
-                        "ignored incoming connection attempts in the last minute (the wallet accepts none)"
+                        "ignored incoming connection attempts in the last minute (the wallet takes only its connector's knocks)"
                     );
                 }
-                continue;
             }
-            incoming = shared.endpoint.accept() => incoming,
-        };
-        let Some(incoming) = incoming else {
+            Some(knock) = handshakes.next(), if !handshakes.is_empty() => {
+                let knock: Result<Result<Connection, ConnectingError>, _> = knock;
+                match knock {
+                    Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN => {
+                        connection.close(CloseCode::Knocked.into(), b"dialing");
+                        let now = Instant::now();
+                        // Connected already: nothing to wake. (A connection left over from a
+                        // connector process that ended does not linger: the new one, with the
+                        // same key, answers its packets with a reset.) Waking it would check a
+                        // healthy connection for nothing, and a busy one could fail the check.
+                        if *shared.state.borrow() == ConnectionState::Connected {
+                            tracing::debug!("the connector knocked while connected: nothing to do");
+                        } else if last_wake.is_some_and(|last| now.duration_since(last) < KNOCK_MIN_GAP) {
+                            tracing::debug!("the connector knocked again moments after: already dialing");
+                        } else {
+                            last_wake = Some(now);
+                            tracing::info!(
+                                state = shared.state.borrow().as_str(),
+                                "the connector knocked: it is up and waiting, dialing it now"
+                            );
+                            shared.knocks.send_modify(|knocks| *knocks = knocks.wrapping_add(1));
+                            // A wake-up: a waiting dial goes now, a connection is checked.
+                            shared.network.send_modify(|generation| *generation = generation.wrapping_add(1));
+                        }
+                    }
+                    Ok(Ok(connection)) => connection.close(CloseCode::Unauthorized.into(), b"knocks only"),
+                    Ok(Err(error)) => tracing::debug!(error = %Redacted(&error), "an incoming knock failed"),
+                    Err(_) => tracing::debug!(timeout_ms = ms(KNOCK_TIMEOUT), "an incoming knock timed out"),
+                }
+            }
+            incoming = shared.endpoint.accept() => {
+                let Some(incoming) = incoming else {
+                    return;
+                };
+                if handshakes.len() >= KNOCKS_IN_FLIGHT {
+                    ignored.count(Instant::now());
+                    incoming.ignore();
+                    continue;
+                }
+                let from = origin(&incoming.remote_addr());
+                match incoming.accept() {
+                    Ok(accepting) => handshakes.push(time::timeout(KNOCK_TIMEOUT, accepting)),
+                    Err(error) => {
+                        tracing::debug!(
+                            origin = from,
+                            error = %Redacted(&error),
+                            "ignored an incoming connection attempt"
+                        );
+                        ignored.count(Instant::now());
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Connector: knocks for its wallet as soon as the session starts, and twice more while the
+/// wallet has not connected — if it knows where the wallet is (a custom relay, or the hint of
+/// [`SessionConfig::with_peer_relay`]). Returns when done.
+async fn knock_on_start(shared: &Shared) {
+    let Some(relay) = shared.config.knock_relay().cloned() else {
+        return;
+    };
+    for at in KNOCKS_AT {
+        time::sleep_until(shared.started_at + at).await;
+        if shared.is_closed() || *shared.state.borrow() == ConnectionState::Connected {
             return;
-        };
-        tracing::debug!(
-            origin = origin(&incoming.remote_addr()),
-            "ignored an incoming connection attempt (the wallet accepts none)"
-        );
-        ignored.count(Instant::now());
-        incoming.ignore();
+        }
+        knock(shared, &relay).await;
+    }
+}
+
+/// One knock at `relay`: whether the wallet took it.
+async fn knock(shared: &Shared, relay: &RelayUrl) -> bool {
+    let started = Instant::now();
+    let addr = EndpointAddr::new(shared.peer).with_relay_url(relay.clone());
+    match time::timeout(KNOCK_TIMEOUT, shared.endpoint.connect(addr, KNOCK_ALPN)).await {
+        Ok(Ok(connection)) => {
+            // The wallet closes it as soon as it took it.
+            let _ = time::timeout(KNOCK_TIMEOUT, connection.closed()).await;
+            tracing::info!(
+                elapsed_ms = ms(started.elapsed()),
+                "knocked: the wallet took it and dials now"
+            );
+            true
+        }
+        Ok(Err(error)) => {
+            // A wallet that predates knocks refuses them; one that is closed is not there.
+            tracing::debug!(elapsed_ms = ms(started.elapsed()), error = %Redacted(&error), "the knock did not get through");
+            false
+        }
+        Err(_) => {
+            tracing::debug!(
+                timeout_ms = ms(KNOCK_TIMEOUT),
+                "the knock got no answer: the wallet is not up"
+            );
+            false
+        }
     }
 }
 

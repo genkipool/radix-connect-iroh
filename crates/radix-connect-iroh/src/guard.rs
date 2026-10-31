@@ -5,7 +5,7 @@ use iroh::{EndpointAddr, EndpointId};
 use n0_future::time::Instant;
 
 use crate::diagnostics::Tally;
-use crate::protocol::{ALPN, CloseCode};
+use crate::protocol::{ALPN, CloseCode, KNOCK_ALPN};
 
 /// Restricts an endpoint to the single peer of its link.
 ///
@@ -27,8 +27,9 @@ impl PeerGuard {
         Self { peer, rejected }
     }
 
+    /// The peer only, with the protocol or a knock (each endpoint accepts only its role's).
     pub(crate) fn is_allowed(&self, remote: EndpointId, alpn: &[u8]) -> bool {
-        remote == self.peer && alpn == ALPN
+        remote == self.peer && (alpn == ALPN || alpn == KNOCK_ALPN)
     }
 }
 
@@ -85,5 +86,7 @@ mod tests {
         assert!(!guard.is_allowed(password.endpoint_id(Role::Connector), ALPN));
         assert!(!guard.is_allowed(other_link.endpoint_id(Role::Wallet), ALPN));
         assert!(!guard.is_allowed(password.endpoint_id(Role::Wallet), b"other/1"));
+        assert!(guard.is_allowed(password.endpoint_id(Role::Wallet), KNOCK_ALPN));
+        assert!(!guard.is_allowed(other_link.endpoint_id(Role::Wallet), KNOCK_ALPN));
     }
 }

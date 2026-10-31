@@ -652,7 +652,10 @@ async fn a_waiting_wallet_redials_only_on_network_changes_made_while_it_waits() 
 
     // The wallet says at once that it is no longer connected, though it waits to dial.
     wait_for_state(&wallet, ConnectionState::Connecting).await;
-    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+    // A connector that does not knock (it predates knocks): only a network change brings the wallet.
+    let mut connector_config = relay_only(&relay_url);
+    connector_config.no_knock = true;
+    let connector = Session::start(&link, Role::Connector, connector_config)
         .await
         .unwrap();
     time::sleep(Duration::from_secs(2)).await;
@@ -1786,7 +1789,10 @@ async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
         &["waiting before dialing again", &session, "delay_ms=120000"],
     )
     .await;
-    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+    // A connector that does not knock (it predates knocks): only the wake-up brings the wallet.
+    let mut connector_config = relay_only(&relay_url);
+    connector_config.no_knock = true;
+    let connector = Session::start(&link, Role::Connector, connector_config)
         .await
         .unwrap();
     time::timeout(WAIT, connector.shared.endpoint.online())
@@ -1811,4 +1817,121 @@ async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
         &["dialing the connector", &session, "reason=network_changed"],
     );
     logs.assert_clean(&link, [40; 32], &[]);
+}
+
+/* ───────────────────────────────── knocks ───────────────────────────────── */
+
+/// A wallet that has been waiting long enough to retry only every 30 s (each attempt given
+/// up after 1 s), as a phone left open with its connector offline.
+fn waiting_slowly(relay_url: &RelayUrl) -> SessionConfig {
+    let mut config = config(relay_url);
+    config.fast_retry_period = Duration::ZERO;
+    config.slow_reconnect_delay = Duration::from_secs(30);
+    config.connect_timeout = Duration::from_secs(1);
+    config
+}
+
+/// Starts a wallet on `link` and lets it settle into its slow retries (its connector is not
+/// up), then returns it.
+async fn wallet_retrying_slowly(link: &ConnectionPassword, relay_url: &RelayUrl) -> Session {
+    let wallet = Session::start(link, Role::Wallet, waiting_slowly(relay_url))
+        .await
+        .unwrap();
+    // Its first attempt fails (no connector), and it waits 30 s for the next.
+    time::sleep(Duration::from_secs(2)).await;
+    assert_ne!(wallet.state(), ConnectionState::Connected);
+    wallet
+}
+
+async fn connected_within(session: &Session, limit: Duration) -> bool {
+    time::timeout(limit, wait_for_state(session, ConnectionState::Connected))
+        .await
+        .is_ok()
+}
+
+#[tokio::test]
+async fn without_a_knock_a_connector_that_starts_waits_for_the_wallets_next_retry() {
+    let (relay_map, relay_url, _guard) = run_relay_server().await.unwrap();
+    let _ = relay_map;
+    let link = password(60);
+    let wallet = wallet_retrying_slowly(&link, &relay_url).await;
+
+    let mut config = config(&relay_url);
+    config.no_knock = true;
+    let connector = Session::start(&link, Role::Connector, config)
+        .await
+        .unwrap();
+
+    assert!(
+        !connected_within(&connector, Duration::from_secs(5)).await,
+        "the wallet only tries again in up to 30 s"
+    );
+    connector.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test]
+async fn a_connector_that_starts_knocks_and_the_waiting_wallet_dials_at_once() {
+    let (relay_map, relay_url, _guard) = run_relay_server().await.unwrap();
+    let _ = relay_map;
+    let link = password(61);
+    let wallet = wallet_retrying_slowly(&link, &relay_url).await;
+
+    let started = Instant::now();
+    let connector = Session::start(&link, Role::Connector, config(&relay_url))
+        .await
+        .unwrap();
+
+    assert!(
+        connected_within(&connector, Duration::from_secs(5)).await,
+        "knocked: the wallet dials now, not at its next retry"
+    );
+    let took = started.elapsed();
+    // And it is a working link.
+    deliver(&wallet, &connector, "after a knock").await.unwrap();
+    assert!(took < Duration::from_secs(5), "{took:?}");
+    connector.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test]
+async fn a_knock_from_anybody_but_the_links_connector_wakes_nothing() {
+    let (relay_map, relay_url, _guard) = run_relay_server().await.unwrap();
+    let _ = relay_map;
+    let link = password(62);
+    let wallet = wallet_retrying_slowly(&link, &relay_url).await;
+
+    // An endpoint with no guard and a key that is not the link's connector's (another link's),
+    // knocking on this wallet's endpoint: the handshake reaches the wallet, which turns it away.
+    let intruder_key = password(63).secret_key(Role::Connector);
+    let builder = Endpoint::builder(presets::Minimal).secret_key(intruder_key);
+    let intruder = with_relays(builder, &config(&relay_url), Role::Connector)
+        .bind()
+        .await
+        .unwrap();
+    let addr = EndpointAddr::new(link.endpoint_id(Role::Wallet)).with_relay_url(relay_url.clone());
+    let knocked = time::timeout(Duration::from_secs(5), async {
+        let connection = intruder.connect(addr, KNOCK_ALPN).await?;
+        // Anything it gets is closed at once: the wallet's guard rejects it after the handshake.
+        Ok::<_, Box<dyn std::error::Error>>(connection.closed().await)
+    })
+    .await;
+
+    let closed = match knocked {
+        Ok(Ok(closed)) => closed,
+        other => panic!("the knock must reach the wallet, to be turned away there: {other:?}"),
+    };
+    assert!(
+        closed.to_string().contains("unauthorized"),
+        "closed as unauthorized, not taken as a knock: {closed}"
+    );
+    time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        *wallet.shared.knocks.borrow(),
+        0,
+        "the wallet was not woken"
+    );
+    assert_ne!(wallet.state(), ConnectionState::Connected);
+    intruder.close().await;
+    wallet.close().await;
 }
