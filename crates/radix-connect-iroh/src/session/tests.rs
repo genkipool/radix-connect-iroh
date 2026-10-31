@@ -1960,39 +1960,34 @@ async fn closing_a_connector_never_waits_for_its_knocks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_connector_that_restarts_without_a_word_gets_its_wallet_back_at_once() {
+async fn a_knock_from_a_second_holder_of_the_link_never_cuts_a_live_connection() {
     let logs = capture();
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(66);
     let (connector, wallet) = connected_pair(&relay_url, &link).await;
-    // Long enough connected that a knock cannot have been in flight when it connected.
-    time::sleep(KNOCK_TIMEOUT + Duration::from_millis(500)).await;
-    // Its process ends (a browser closed, a command finished) without closing: the wallet
-    // still believes it is connected, and QUIC alone would say otherwise only after 30 s.
-    drop(connector);
-    let started = time::Instant::now();
-    let restarted = Session::start(&link, Role::Connector, config(&relay_url))
+    let connected_since = wallet.diagnostics().connected_for.unwrap();
+    // Another process with the same link starts (two logins at once) and knocks: seen against a
+    // phone, checking the connection then failed on a live one and lost the answer it carried.
+    let second = Session::start(&link, Role::Connector, config(&relay_url))
         .await
         .unwrap();
-    time::timeout(
-        Duration::from_secs(8),
-        wait_for_state(&restarted, ConnectionState::Connected),
+    logs.wait_for(
+        Level::DEBUG,
+        &["the connector knocked while connected: nothing to do"],
     )
-    .await
-    .expect("the wallet dropped the dead connection and dialed the new session");
+    .await;
+    let still = wallet.diagnostics().connected_for.expect("still connected");
     assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "{:?}",
-        started.elapsed()
+        still > connected_since,
+        "the same connection: {still:?} > {connected_since:?}"
     );
-    logs.expect(
-        Level::INFO,
-        &["the connector knocked while connected: checking the connection is still alive"],
+    let session = format!("session={} ", wallet.shared.session);
+    assert_eq!(
+        logs.count(Level::INFO, &["disconnected from the peer", &session]),
+        0,
+        "the wallet kept it"
     );
-    deliver(&restarted, &wallet, "after the restart")
-        .await
-        .unwrap();
-    restarted.close().await;
+    second.close().await;
+    connector.close().await;
     wallet.close().await;
 }
-

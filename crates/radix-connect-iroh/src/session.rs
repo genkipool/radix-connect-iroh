@@ -1431,24 +1431,15 @@ async fn answer_knocks(shared: &Shared) {
                     Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN => {
                         connection.close(CloseCode::Knocked.into(), b"dialing");
                         let now = Instant::now();
-                        // A connector knocks only while IT is not connected. Connected here for
-                        // longer than a knock can take, the connection may be one the connector
-                        // no longer has — its process ended or the browser closed without saying
-                        // so, and nothing tells this end for 30 s — or a live one with another
-                        // process holding the same link (a second host of it). So check it, as
-                        // after a network change: a dead one is dropped within seconds and
-                        // redialed at once; a live one stays.
-                        let check = shared
-                            .connection
-                            .borrow()
-                            .as_ref()
-                            .is_some_and(|c| now.duration_since(c.connected_at) >= KNOCK_TIMEOUT);
-                        if check {
-                            last_wake = Some(now);
-                            tracing::info!("the connector knocked while connected: checking the connection is still alive");
-                            shared.network.send_modify(|generation| *generation = generation.wrapping_add(1));
-                        } else if *shared.state.borrow() == ConnectionState::Connected {
-                            tracing::debug!("the connector knocked while just connected: its knock was in flight");
+                        // Connected already: nothing to wake, and nothing to check. A knock
+                        // while connected comes from another process holding the same link (two
+                        // logins at once, say) or from a connector that restarted without closing
+                        // the old connection. Checking the connection then is no answer: with two
+                        // holders the check fails on a live connection, and cutting it loses what
+                        // it carries — a signature the person just approved. A dead connection
+                        // ends on its own (QUIC's idle timeout) and the wallet redials then.
+                        if *shared.state.borrow() == ConnectionState::Connected {
+                            tracing::debug!("the connector knocked while connected: nothing to do");
                         } else if last_wake.is_some_and(|last| now.duration_since(last) < KNOCK_MIN_GAP) {
                             tracing::debug!("the connector knocked again moments after: already dialing");
                         } else {
