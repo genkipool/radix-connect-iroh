@@ -7,8 +7,8 @@ use std::time::Duration;
 use iroh::address_lookup::DnsAddressLookup;
 use iroh::address_lookup::{AddrFilter, PkarrPublisher, PkarrResolver};
 use iroh::endpoint::{
-    ConnectingError, Connection, IncomingAddr, PathEvent, QuicTransportConfig, RecvStream,
-    SendStream, presets,
+    ConnectOptions, ConnectingError, Connection, IncomingAddr, PathEvent, QuicTransportConfig,
+    RecvStream, SendStream, presets,
 };
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, RelayConfig, RelayMap, RelayMode, RelayUrl, TransportAddr,
@@ -1391,7 +1391,9 @@ impl RelayLog {
 /// How many knocks a wallet takes at once: a knock is one handshake, and nothing else.
 const KNOCKS_IN_FLIGHT: usize = 4;
 /// How long a knock's handshake may take.
-const KNOCK_TIMEOUT: Duration = Duration::from_secs(5);
+const KNOCK_TIMEOUT: Duration = Duration::from_secs(3);
+/// A knock's initial RTT estimate: about a relay's round trip.
+const KNOCK_INITIAL_RTT: Duration = Duration::from_millis(100);
 /// Knocks closer together than this wake the wallet once: even its own connector cannot keep
 /// it dialing.
 const KNOCK_MIN_GAP: Duration = Duration::from_secs(2);
@@ -1486,12 +1488,28 @@ async fn knock_on_start(shared: &Shared) {
     let Some(relay) = shared.config.knock_relay().cloned() else {
         return;
     };
+    // Through the relay only, so only once this end reaches it: a knock before then cannot
+    // arrive, and would only linger in the endpoint until it gives up.
+    tokio::select! {
+        biased;
+        () = shared.wait_closed() => return,
+        () = shared.endpoint.online() => {}
+    }
     for at in KNOCKS_AT {
-        time::sleep_until(shared.started_at + at).await;
-        if shared.is_closed() || *shared.state.borrow() == ConnectionState::Connected {
+        // Closing never waits for a knock (nor for the next one).
+        tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            () = time::sleep_until(shared.started_at + at) => {}
+        }
+        if *shared.state.borrow() == ConnectionState::Connected {
             return;
         }
-        knock(shared, &relay).await;
+        tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            _ = knock(shared, &relay) => {}
+        }
     }
 }
 
@@ -1499,7 +1517,26 @@ async fn knock_on_start(shared: &Shared) {
 async fn knock(shared: &Shared, relay: &RelayUrl) -> bool {
     let started = Instant::now();
     let addr = EndpointAddr::new(shared.peer).with_relay_url(relay.clone());
-    match time::timeout(KNOCK_TIMEOUT, shared.endpoint.connect(addr, KNOCK_ALPN)).await {
+    // Its own transport settings: an initial RTT close to a relay's, not QUIC's 333 ms guess, so
+    // a knock retries quickly while the wallet is not up, and a knock abandoned when the session
+    // closes drains in a fraction of a second instead of holding up the endpoint for 3.
+    let options = ConnectOptions::new().with_transport_config(
+        QuicTransportConfig::builder()
+            .initial_rtt(KNOCK_INITIAL_RTT)
+            .max_concurrent_bidi_streams(0u32.into())
+            .max_concurrent_uni_streams(0u32.into())
+            .build(),
+    );
+    let knocking = async {
+        shared
+            .endpoint
+            .connect_with_opts(addr, KNOCK_ALPN, options)
+            .await
+            .map_err(|error| Redacted(error).to_string())?
+            .await
+            .map_err(|error| Redacted(error).to_string())
+    };
+    match time::timeout(KNOCK_TIMEOUT, knocking).await {
         Ok(Ok(connection)) => {
             // The wallet closes it as soon as it took it.
             let _ = time::timeout(KNOCK_TIMEOUT, connection.closed()).await;
@@ -1511,7 +1548,11 @@ async fn knock(shared: &Shared, relay: &RelayUrl) -> bool {
         }
         Ok(Err(error)) => {
             // A wallet that predates knocks refuses them; one that is closed is not there.
-            tracing::debug!(elapsed_ms = ms(started.elapsed()), error = %Redacted(&error), "the knock did not get through");
+            tracing::debug!(
+                elapsed_ms = ms(started.elapsed()),
+                error,
+                "the knock did not get through"
+            );
             false
         }
         Err(_) => {

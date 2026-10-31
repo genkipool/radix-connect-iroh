@@ -654,7 +654,7 @@ async fn a_waiting_wallet_redials_only_on_network_changes_made_while_it_waits() 
     wait_for_state(&wallet, ConnectionState::Connecting).await;
     // A connector that does not knock (it predates knocks): only a network change brings the wallet.
     let mut connector_config = relay_only(&relay_url);
-    connector_config.no_knock = true;
+    connector_config = connector_config.without_knocks();
     let connector = Session::start(&link, Role::Connector, connector_config)
         .await
         .unwrap();
@@ -1791,7 +1791,7 @@ async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
     .await;
     // A connector that does not knock (it predates knocks): only the wake-up brings the wallet.
     let mut connector_config = relay_only(&relay_url);
-    connector_config.no_knock = true;
+    connector_config = connector_config.without_knocks();
     let connector = Session::start(&link, Role::Connector, connector_config)
         .await
         .unwrap();
@@ -1857,7 +1857,7 @@ async fn without_a_knock_a_connector_that_starts_waits_for_the_wallets_next_retr
     let wallet = wallet_retrying_slowly(&link, &relay_url).await;
 
     let mut config = config(&relay_url);
-    config.no_knock = true;
+    config = config.without_knocks();
     let connector = Session::start(&link, Role::Connector, config)
         .await
         .unwrap();
@@ -1934,4 +1934,27 @@ async fn a_knock_from_anybody_but_the_links_connector_wakes_nothing() {
     assert_ne!(wallet.state(), ConnectionState::Connected);
     intruder.close().await;
     wallet.close().await;
+}
+
+#[tokio::test]
+async fn closing_a_connector_never_waits_for_its_knocks() {
+    let (relay_map, relay_url, _guard) = run_relay_server().await.unwrap();
+    let _ = relay_map;
+    // No wallet: every knock waits for an answer that never comes.
+    let connector = Session::start(&password(64), Role::Connector, config(&relay_url))
+        .await
+        .unwrap();
+    // Its first knock is in flight (it starts once the relay is reached, at once here).
+    time::timeout(WAIT, connector.shared.endpoint.online())
+        .await
+        .unwrap();
+    time::sleep(Duration::from_secs(1)).await;
+
+    let closing = Instant::now();
+    connector.close().await;
+    assert!(
+        closing.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        closing.elapsed()
+    );
 }

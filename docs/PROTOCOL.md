@@ -234,6 +234,8 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   wallet wake it once; at most 4 knock handshakes are in progress at once.
 - A wallet that predates knocks registers no ALPN and refuses the handshake; a connector
   that predates them never knocks. Either way the link works as before.
+- A pairing session does not knock: the wallet does not know the link before it scans the
+  QR, and dials it then.
 - On n0's public relays the wallet publishes no address (§4): the connector can only knock
   at a relay it remembers, which costs the phone nothing and publishes nothing new. A
   wrong or outdated relay only means the knock does not arrive.
