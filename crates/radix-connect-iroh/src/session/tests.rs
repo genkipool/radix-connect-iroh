@@ -1987,7 +1987,7 @@ async fn a_connector_that_restarts_without_a_word_gets_its_wallet_back_at_once()
     );
     logs.expect(
         Level::INFO,
-        &["the connector knocked while connected: it restarted"],
+        &["the connector knocked while connected: checking the connection is still alive"],
     );
     deliver(&restarted, &wallet, "after the restart")
         .await
@@ -1995,3 +1995,4 @@ async fn a_connector_that_restarts_without_a_word_gets_its_wallet_back_at_once()
     restarted.close().await;
     wallet.close().await;
 }
+

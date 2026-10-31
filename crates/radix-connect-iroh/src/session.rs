@@ -1431,23 +1431,21 @@ async fn answer_knocks(shared: &Shared) {
                     Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN => {
                         connection.close(CloseCode::Knocked.into(), b"dialing");
                         let now = Instant::now();
-                        // A connector knocks only while IT is not connected. Connected here
-                        // for longer than a knock can take, the connection is one the
-                        // connector no longer has — its process ended or the browser closed
-                        // without saying so, and nothing tells this end for 30 s (its packets
-                        // just go unanswered): drop it and dial the new session at once.
-                        // Newer than that, the knock was in flight when this dial landed.
-                        let stale = match shared.connection.borrow().as_ref() {
-                            Some(c) if now.duration_since(c.connected_at) >= KNOCK_TIMEOUT => {
-                                c.connection.close(CloseCode::Replaced.into(), b"the connector restarted");
-                                true
-                            }
-                            _ => false,
-                        };
-                        if stale {
+                        // A connector knocks only while IT is not connected. Connected here for
+                        // longer than a knock can take, the connection may be one the connector
+                        // no longer has — its process ended or the browser closed without saying
+                        // so, and nothing tells this end for 30 s — or a live one with another
+                        // process holding the same link (a second host of it). So check it, as
+                        // after a network change: a dead one is dropped within seconds and
+                        // redialed at once; a live one stays.
+                        let check = shared
+                            .connection
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|c| now.duration_since(c.connected_at) >= KNOCK_TIMEOUT);
+                        if check {
                             last_wake = Some(now);
-                            tracing::info!("the connector knocked while connected: it restarted, so this connection is dead; dialing it now");
-                            shared.knocks.send_modify(|knocks| *knocks = knocks.wrapping_add(1));
+                            tracing::info!("the connector knocked while connected: checking the connection is still alive");
                             shared.network.send_modify(|generation| *generation = generation.wrapping_add(1));
                         } else if *shared.state.borrow() == ConnectionState::Connected {
                             tracing::debug!("the connector knocked while just connected: its knock was in flight");
