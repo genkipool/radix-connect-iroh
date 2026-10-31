@@ -1958,3 +1958,40 @@ async fn closing_a_connector_never_waits_for_its_knocks() {
         closing.elapsed()
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connector_that_restarts_without_a_word_gets_its_wallet_back_at_once() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(66);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    // Long enough connected that a knock cannot have been in flight when it connected.
+    time::sleep(KNOCK_TIMEOUT + Duration::from_millis(500)).await;
+    // Its process ends (a browser closed, a command finished) without closing: the wallet
+    // still believes it is connected, and QUIC alone would say otherwise only after 30 s.
+    drop(connector);
+    let started = time::Instant::now();
+    let restarted = Session::start(&link, Role::Connector, config(&relay_url))
+        .await
+        .unwrap();
+    time::timeout(
+        Duration::from_secs(8),
+        wait_for_state(&restarted, ConnectionState::Connected),
+    )
+    .await
+    .expect("the wallet dropped the dead connection and dialed the new session");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    logs.expect(
+        Level::INFO,
+        &["the connector knocked while connected: it restarted"],
+    );
+    deliver(&restarted, &wallet, "after the restart")
+        .await
+        .unwrap();
+    restarted.close().await;
+    wallet.close().await;
+}

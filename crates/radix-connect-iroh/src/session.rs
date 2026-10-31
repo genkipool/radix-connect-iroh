@@ -1431,12 +1431,26 @@ async fn answer_knocks(shared: &Shared) {
                     Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN => {
                         connection.close(CloseCode::Knocked.into(), b"dialing");
                         let now = Instant::now();
-                        // Connected already: nothing to wake. (A connection left over from a
-                        // connector process that ended does not linger: the new one, with the
-                        // same key, answers its packets with a reset.) Waking it would check a
-                        // healthy connection for nothing, and a busy one could fail the check.
-                        if *shared.state.borrow() == ConnectionState::Connected {
-                            tracing::debug!("the connector knocked while connected: nothing to do");
+                        // A connector knocks only while IT is not connected. Connected here
+                        // for longer than a knock can take, the connection is one the
+                        // connector no longer has — its process ended or the browser closed
+                        // without saying so, and nothing tells this end for 30 s (its packets
+                        // just go unanswered): drop it and dial the new session at once.
+                        // Newer than that, the knock was in flight when this dial landed.
+                        let stale = match shared.connection.borrow().as_ref() {
+                            Some(c) if now.duration_since(c.connected_at) >= KNOCK_TIMEOUT => {
+                                c.connection.close(CloseCode::Replaced.into(), b"the connector restarted");
+                                true
+                            }
+                            _ => false,
+                        };
+                        if stale {
+                            last_wake = Some(now);
+                            tracing::info!("the connector knocked while connected: it restarted, so this connection is dead; dialing it now");
+                            shared.knocks.send_modify(|knocks| *knocks = knocks.wrapping_add(1));
+                            shared.network.send_modify(|generation| *generation = generation.wrapping_add(1));
+                        } else if *shared.state.borrow() == ConnectionState::Connected {
+                            tracing::debug!("the connector knocked while just connected: its knock was in flight");
                         } else if last_wake.is_some_and(|last| now.duration_since(last) < KNOCK_MIN_GAP) {
                             tracing::debug!("the connector knocked again moments after: already dialing");
                         } else {
@@ -1488,12 +1502,16 @@ async fn knock_on_start(shared: &Shared) {
     let Some(relay) = shared.config.knock_relay().cloned() else {
         return;
     };
-    // Through the relay only, so only once this end reaches it: a knock before then cannot
-    // arrive, and would only linger in the endpoint until it gives up.
-    tokio::select! {
-        biased;
-        () = shared.wait_closed() => return,
-        () = shared.endpoint.online() => {}
+    // On a custom relay, once this end reaches it: it is the relay the knock goes through, and
+    // that takes milliseconds. On n0's public relays, at once: the knock goes to the WALLET's
+    // relay over a connection of its own, while choosing this end's home relay takes seconds
+    // (the endpoint measures them all first).
+    if matches!(shared.config.relays(), Relays::Custom(_)) {
+        tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            () = shared.endpoint.online() => {}
+        }
     }
     for at in KNOCKS_AT {
         // Closing never waits for a knock (nor for the next one).
