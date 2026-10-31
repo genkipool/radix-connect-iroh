@@ -258,6 +258,62 @@ async fn a_closed_session_reports_disconnected() {
     assert_eq!(wallet.state(), ConnectionState::Disconnected);
 }
 
+/// Waits until the connector hears the wallet's presence say `in_background`.
+async fn heard(connector: &Session, in_background: bool) {
+    time::timeout(Duration::from_secs(10), async {
+        while connector.peer_in_background() != in_background {
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("the connector never heard in_background = {in_background}"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_connector_hears_whether_the_wallet_app_is_in_the_background() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(31);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    assert!(
+        !connector.peer_in_background(),
+        "nothing said: in the foreground"
+    );
+
+    wallet.set_in_background(true);
+    heard(&connector, true).await;
+    wallet.set_in_background(false);
+    heard(&connector, false).await;
+
+    // Messages go on as ever.
+    deliver(&connector, &wallet, "{\"still\":\"talking\"}")
+        .await
+        .unwrap();
+    wallet.close().await;
+    connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_in_the_background_says_so_on_every_new_connection() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(32);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    wallet.set_in_background(true);
+    heard(&connector, true).await;
+
+    // The connector restarts: the new one hears it as soon as the wallet is back.
+    connector.close().await;
+    drop(connector);
+    wait_for_state(&wallet, ConnectionState::Connecting).await;
+    let connector = Session::start(&link, Role::Connector, relay_only(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    heard(&connector, true).await;
+
+    wallet.close().await;
+    connector.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn the_wallet_reconnects_when_the_connector_restarts() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();

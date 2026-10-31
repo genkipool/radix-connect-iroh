@@ -1,6 +1,6 @@
 use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -224,6 +224,11 @@ struct Shared {
     relay: relay_health::Registration,
     /// Connections the guard rejected as unauthorized, summarised every minute.
     unauthorized: Arc<std::sync::Mutex<Tally>>,
+    /// Wallet: whether its app is in the background, as the host said; told to the connector
+    /// on every connection.
+    in_background: AtomicBool,
+    /// Connector: whether the wallet said its app is in the background, on this connection.
+    peer_in_background: AtomicBool,
 }
 
 /// The parts of [`Diagnostics`] that iroh does not keep for us.
@@ -262,8 +267,10 @@ impl Session {
             .max_concurrent_bidi_streams(MAX_CONCURRENT_STREAMS.into())
             .max_concurrent_uni_streams(0u32.into())
             .receive_window(RECEIVE_WINDOW.into())
-            // The protocol uses no datagrams: don't buffer any.
-            .datagram_receive_buffer_size(None)
+            // The only datagrams are the wallet's presence (`protocol::presence`): room for a
+            // few. A wallet needs it too, to send them (QUIC sends datagrams only with them on),
+            // though no connector sends it any.
+            .datagram_receive_buffer_size(Some(protocol::PRESENCE_BUFFER))
             .build();
         // The connector accepts the wallet's connections; the wallet accepts only knocks
         // (its connector telling it to dial now), and no connection that carries anything.
@@ -335,6 +342,8 @@ impl Session {
             received: AtomicU64::new(0),
             relay,
             unauthorized,
+            in_background: AtomicBool::new(false),
+            peer_in_background: AtomicBool::new(false),
         });
         span.in_scope(|| {
             let config = &shared.config;
@@ -425,6 +434,27 @@ impl Session {
         knock(&self.shared, relay)
             .instrument(self.shared.span.clone())
             .await
+    }
+
+    /// Wallet: tells the connector whether the app is in the background (call when it goes
+    /// there and when it comes back), now and on every later connection. A connector racing
+    /// several wallets for one request then sends it to the one the person opens, not to one
+    /// still connected a while after its app went to the background. Best effort: a connector
+    /// that predates this ignores it, and nothing else changes.
+    pub fn set_in_background(&self, in_background: bool) {
+        self.shared
+            .in_background
+            .store(in_background, Ordering::Relaxed);
+        if let Some(current) = self.shared.connection.borrow().clone() {
+            self.shared.tell_presence(&current.connection);
+        }
+    }
+
+    /// Connector: whether the wallet said its app is in the background, on the current
+    /// connection. `false` when it said nothing (a wallet that predates this), or once it is
+    /// back in the foreground.
+    pub fn peer_in_background(&self) -> bool {
+        self.shared.peer_in_background.load(Ordering::Relaxed)
     }
 
     pub fn diagnostics(&self) -> Diagnostics {
@@ -556,6 +586,53 @@ impl Drop for Session {
 }
 
 impl Shared {
+    /// Wallet: sends its presence on `connection` (twice, a moment apart: a datagram may be
+    /// lost, and a lost one only means the connector believes the app is in the foreground).
+    fn tell_presence(&self, connection: &iroh::endpoint::Connection) {
+        if self.role != Role::Wallet {
+            return;
+        }
+        let in_background = self.in_background.load(Ordering::Relaxed);
+        let datagram = protocol::presence(in_background);
+        let sent = |connection: &iroh::endpoint::Connection| {
+            connection
+                .send_datagram(bytes::Bytes::copy_from_slice(&datagram))
+                .is_ok()
+        };
+        if !sent(connection) {
+            // A connector that predates presence takes no datagrams: nothing to tell it.
+            tracing::debug!(
+                in_background,
+                "presence not sent: the peer takes no datagrams"
+            );
+            return;
+        }
+        tracing::debug!(in_background, "told the peer the app's presence");
+        let again = connection.clone();
+        task::spawn(async move {
+            time::sleep(Duration::from_millis(250)).await;
+            let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&datagram));
+        });
+    }
+
+    /// Connector: what the wallet said of its app.
+    fn heard_presence(&self, in_background: bool) {
+        let before = self
+            .peer_in_background
+            .swap(in_background, Ordering::Relaxed);
+        if before != in_background {
+            tracing::info!(
+                in_background,
+                "the wallet says its app is {}",
+                if in_background {
+                    "in the background"
+                } else {
+                    "in the foreground"
+                }
+            );
+        }
+    }
+
     fn is_closed(&self) -> bool {
         *self.closed.borrow()
     }
@@ -1061,6 +1138,8 @@ async fn dial(shared: &Arc<Shared>) {
                 shared.record_connected();
                 shared.set_state(ConnectionState::Connected);
                 shared.log_connected(&current, elapsed, Some(attempt));
+                // Every connection starts as the app's: the connector hears where it is now.
+                shared.tell_presence(&current.connection);
                 // `None`: the session is closing, and closes the connection itself.
                 let Some(Ended {
                     reason: ended,
@@ -1742,6 +1821,8 @@ async fn accept(shared: &Arc<Shared>) -> Option<Serving> {
                 }
                 let current = shared.current(connection.clone());
                 shared.connection.send_replace(Some(current.clone()));
+                // Until the wallet says otherwise (one that predates presence never does).
+                shared.peer_in_background.store(false, Ordering::Relaxed);
                 // Replacing the task stops serving the previous connection.
                 if let Some(Serving { current: previous, .. }) = serving.take() {
                     previous.connection.close(CloseCode::Replaced.into(), b"replaced");
@@ -2065,6 +2146,8 @@ async fn serve_streams(shared: &Shared, current: &Current) -> Option<String> {
         kind: initial,
         direct_seen: initial == Some(PathKind::Direct),
     };
+    // Only a connector hears datagrams; one whose connection stopped yielding them stops asking.
+    let mut datagrams = shared.role == Role::Connector;
     loop {
         let stream = tokio::select! {
             biased;
@@ -2074,6 +2157,14 @@ async fn serve_streams(shared: &Shared, current: &Current) -> Option<String> {
                 continue;
             }
             stream = connection.accept_bi() => stream,
+            datagram = connection.read_datagram(), if datagrams => {
+                match datagram.as_deref().ok().map(protocol::read_presence) {
+                    Some(Some(in_background)) => shared.heard_presence(in_background),
+                    Some(None) => tracing::debug!("ignored a datagram that is not a presence one"),
+                    None => datagrams = false,
+                }
+                continue;
+            }
         };
         let (send, recv) = match stream {
             Ok(stream) => stream,

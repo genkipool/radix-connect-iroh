@@ -36,6 +36,30 @@ pub const ALPN: &[u8] = b"radix-connect/iroh/1";
 /// handshake (which proves the connector's key) is done. A wallet that predates it refuses it.
 pub const KNOCK_ALPN: &[u8] = b"radix-connect/iroh/knock/1";
 
+/// First byte of a presence datagram: the wallet says whether its app is in the background.
+///
+/// Datagrams carry nothing else, and only from the wallet: a connector reads them to tell a
+/// wallet the person just opened from one still connected a while after the app went to the
+/// background. A peer that predates them does not accept datagrams at all (its QUIC transport
+/// says so), and the wallet's send fails quietly: nothing changes for it.
+const PRESENCE: u8 = 0x50;
+
+/// The presence datagram for `in_background`.
+pub(crate) fn presence(in_background: bool) -> [u8; 2] {
+    [PRESENCE, u8::from(in_background)]
+}
+
+/// Whether a datagram is a presence one, and what it says: `Some(true)` in the background.
+pub(crate) fn read_presence(datagram: &[u8]) -> Option<bool> {
+    match datagram {
+        [PRESENCE, state] => Some(*state != 0),
+        _ => None,
+    }
+}
+
+/// Room for the few presence datagrams in flight (a connector's only datagrams).
+pub(crate) const PRESENCE_BUFFER: usize = 1024;
+
 /// Status byte: the message was received and taken by the application.
 const STATUS_RECEIVED: u8 = 0x00;
 /// Status byte: the message was refused (too large, malformed or not UTF-8).

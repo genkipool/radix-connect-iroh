@@ -392,6 +392,14 @@ impl IrohSession {
         let _ = on_runtime(async move { session.network_changed().await }).await;
     }
 
+    /// Wallet: tells the connector whether the app is in the background — call when it goes
+    /// there and when it comes back. A connector racing several wallets for one request then
+    /// sends it to the one the person opens. Best effort, and nothing changes for a connector
+    /// that predates it.
+    pub fn set_in_background(&self, in_background: bool) {
+        self.session.set_in_background(in_background);
+    }
+
     /// Closes the connection, telling the peer, and the endpoint. Idempotent.
     ///
     /// The shutdown runs to completion even if the caller is cancelled.

@@ -14,6 +14,7 @@ readme = "../../README.md"
 [dependencies]
 iroh.workspace = true
 blake3.workspace = true
+bytes.workspace = true
 hex.workspace = true
 n0-future.workspace = true
 thiserror.workspace = true
