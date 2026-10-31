@@ -200,11 +200,16 @@ impl IrohSession {
     /// `relayUrl` it uses n0's public relays (the default); otherwise that custom relay.
     /// Both ends of a link must make the same choice. Connecting happens in the
     /// background (see `nextEvent`).
+    ///
+    /// `peerRelayUrl`: for a connector, the relay its wallet was last seen on (`peerRelay`,
+    /// kept with the link): the session knocks there as it starts, and a wallet that is up
+    /// connects at once. A wrong or unusable one only means no knock.
     pub async fn start(
         password: Vec<u8>,
         #[wasm_bindgen(unchecked_param_type = "IrohRole")] role: String,
         #[wasm_bindgen(js_name = relayUrl)] relay_url: Option<String>,
         #[wasm_bindgen(js_name = ackTimeoutMs)] ack_timeout_ms: Option<u32>,
+        #[wasm_bindgen(js_name = peerRelayUrl)] peer_relay_url: Option<String>,
     ) -> Result<IrohSession, JsValue> {
         let password = password_from(password)?;
         let role = role_from(&role)?;
@@ -212,6 +217,12 @@ impl IrohSession {
             core::SessionConfig::for_relay(relay_url.as_deref()).map_err(error_from)?;
         if let Some(ack_timeout_ms) = ack_timeout_ms {
             config = config.with_ack_timeout(Duration::from_millis(ack_timeout_ms.into()));
+        }
+        if let Some(peer_relay_url) = peer_relay_url.as_deref() {
+            config = config
+                .clone()
+                .with_peer_relay(peer_relay_url)
+                .unwrap_or(config);
         }
         install_subscriber();
         let session = core::Session::start(&password, role, config)
@@ -278,6 +289,19 @@ impl IrohSession {
     /// became active again: a waiting wallet dials at once, and the current connection
     /// is checked, dropped within seconds if the peer no longer answers (instead of
     /// looking connected until it times out).
+    /// The relay the peer is on, as this end knows it (best while connected), or undefined:
+    /// for a connector, what to keep with the link and pass back as `peerRelayUrl`.
+    #[wasm_bindgen(js_name = peerRelay, unchecked_return_type = "Promise<string | undefined>")]
+    pub fn peer_relay(&self) -> Promise {
+        let session = self.session.clone();
+        future_to_promise(async move {
+            Ok(session
+                .peer_relay()
+                .await
+                .map_or(JsValue::UNDEFINED, |url| JsValue::from_str(url.as_str())))
+        })
+    }
+
     #[wasm_bindgen(js_name = networkChanged, unchecked_return_type = "Promise<void>")]
     pub fn network_changed(&self) -> Promise {
         let session = self.session.clone();
