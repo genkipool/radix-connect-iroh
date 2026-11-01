@@ -109,13 +109,18 @@ pub enum IrohSessionEvent {
     },
 }
 
-impl From<core::SessionEvent> for IrohSessionEvent {
-    fn from(event: core::SessionEvent) -> Self {
+impl IrohSessionEvent {
+    /// The event for the host, or `None` for one only a connector hears (a request
+    /// delivered again, the wallet's presence): this binding runs the wallet's end.
+    fn from_core(event: core::SessionEvent) -> Option<Self> {
         match event {
-            core::SessionEvent::StateChanged(state) => Self::StateChanged {
+            core::SessionEvent::StateChanged(state) => Some(Self::StateChanged {
                 state: state.into(),
-            },
-            core::SessionEvent::Message(message) => Self::Message { message },
+            }),
+            core::SessionEvent::Message(message) => Some(Self::Message { message }),
+            core::SessionEvent::RequestRedelivered(_) | core::SessionEvent::PeerPresence { .. } => {
+                None
+            }
         }
     }
 }
@@ -379,7 +384,11 @@ impl IrohSession {
     /// Polled directly by the caller rather than on the runtime: receiving is
     /// cancel-safe, so a cancelled call never loses an event.
     pub async fn next_event(&self) -> Option<IrohSessionEvent> {
-        self.session.next_event().await.map(Into::into)
+        loop {
+            if let Some(event) = IrohSessionEvent::from_core(self.session.next_event().await?) {
+                return Some(event);
+            }
+        }
     }
 
     /// Reports a change of the device's network, or the app returning to the

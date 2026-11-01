@@ -2622,13 +2622,14 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "radix-connect-iroh"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "blake3",
  "bytes",
  "hex",
  "iroh",
  "n0-future",
+ "serde_json",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -2639,7 +2640,7 @@ dependencies = [
 
 [[package]]
 name = "radix-connect-iroh-uniffi"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "iroh",
  "jni 0.21.1",
@@ -2655,7 +2656,7 @@ dependencies = [
 
 [[package]]
 name = "radix-connect-iroh-wasm"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "js-sys",
  "n0-future",

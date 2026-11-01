@@ -47,7 +47,7 @@ async fn next_message(session: &Session) -> String {
         loop {
             match session.next_event().await {
                 Some(SessionEvent::Message(message)) => return message,
-                Some(SessionEvent::StateChanged(_)) => {}
+                Some(_) => {}
                 None => panic!("session closed while waiting for a message"),
             }
         }
@@ -310,6 +310,91 @@ async fn a_wallet_in_the_background_says_so_on_every_new_connection() {
     wait_for_state(&connector, ConnectionState::Connected).await;
     heard(&connector, true).await;
 
+    wallet.close().await;
+    connector.close().await;
+}
+
+fn dapp_request(id: &str) -> String {
+    format!(
+        r#"{{"interactionId":"{id}","items":{{"discriminator":"transaction"}},"metadata":{{}}}}"#
+    )
+}
+
+fn wallet_answer(id: &str) -> String {
+    format!(r#"{{"discriminator":"success","interactionId":"{id}","items":{{}}}}"#)
+}
+
+/// The id of the next request the connector reports delivered again.
+async fn next_redelivered(connector: &Session) -> String {
+    time::timeout(WAIT, async {
+        loop {
+            match connector.next_event().await {
+                Some(SessionEvent::RequestRedelivered(id)) => return id,
+                Some(_) => {}
+                None => panic!("session closed while waiting for a redelivery"),
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for a redelivery")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_request_the_wallet_lost_with_its_app_comes_back_when_it_returns() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(33);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    deliver(&connector, &wallet, &dapp_request("lost"))
+        .await
+        .unwrap();
+
+    // The app is killed, holding the request in memory; it is opened again.
+    drop(wallet);
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+
+    let (received, redelivered) = tokio::join!(next_message(&wallet), next_redelivered(&connector));
+    assert_eq!(received, dapp_request("lost"));
+    assert_eq!(redelivered, "lost");
+    assert!(connector.peer_reports_requests());
+
+    // Delivered on this connection: the host sending it again changes nothing.
+    connector.send(&dapp_request("lost")).await.unwrap();
+    assert!(
+        time::timeout(Duration::from_secs(1), next_message(&wallet))
+            .await
+            .is_err(),
+        "the wallet got it twice"
+    );
+    wallet.close().await;
+    connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answered_request_is_not_delivered_again() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(34);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    deliver(&connector, &wallet, &dapp_request("done"))
+        .await
+        .unwrap();
+    deliver(&wallet, &connector, &wallet_answer("done"))
+        .await
+        .unwrap();
+
+    drop(wallet);
+    let wallet = Session::start(&link, Role::Wallet, config(&relay_url))
+        .await
+        .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+
+    assert!(
+        time::timeout(Duration::from_secs(2), next_message(&wallet))
+            .await
+            .is_err(),
+        "an answered request came back"
+    );
     wallet.close().await;
     connector.close().await;
 }

@@ -97,6 +97,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                     eprintln!("diagnostics: {}", session.diagnostics());
                 }
                 Some(SessionEvent::Message(message)) => println!("message {message}"),
+                Some(SessionEvent::RequestRedelivered(id)) => println!("redelivered {id}"),
+                Some(SessionEvent::PeerPresence { in_background }) => {
+                    println!("peer-background {in_background}");
+                }
                 None => break,
             },
             line = stdin.next_line() => match line? {

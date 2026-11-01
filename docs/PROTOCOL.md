@@ -240,6 +240,43 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   at a relay it remembers, which costs the phone nothing and publishes nothing new. A
   wrong or outdated relay only means the knock does not arrive.
 
+### 7.2 Presence and request inventory (datagrams)
+
+The wallet sends QUIC datagrams on every connection, twice a moment apart (a datagram may
+be lost), and again whenever its app changes state. Only the wallet sends them and only the
+connector reads them; a peer that predates them takes no datagrams, or ignores those it
+does not know, and nothing else changes.
+
+- **Presence** (since 0.1.4): `0x50` then `0x01` when the app is in the background, `0x00`
+  when it is in the foreground. The connector tells its host when it changes
+  (`PeerPresence`).
+- **Request inventory** (since 0.1.5): `0x49`, a flags byte (`0x01`: every request is
+  listed), then 8 bytes per request the wallet holds: the first 8 bytes of the BLAKE3 hash
+  of its `interactionId`, at most 100.
+
+A wallet keeps the dApp requests it received in memory, and loses them when its app is
+closed or the system ends it — which the connector cannot see: the process runs no more
+code, and the connection only times out (QUIC's idle timeout, 30 s). The inventory lets the
+connector find out when the wallet is back:
+
+- the wallet's session lists each request (a message with `interactionId` and `items`) its
+  host took, and drops it when the host's answer (`discriminator` `success` or `failure`) is
+  confirmed, or the dApp cancels it (`items.discriminator` `cancelRequest`). The list lives
+  in the app's process: it is lost exactly when the requests are;
+- the connector's session keeps each request it delivered, with the connection it was
+  delivered on, until the wallet answers it or the dApp cancels it;
+- on a complete inventory, the connector delivers again, on that connection and with the
+  same message, each request delivered on an **earlier** connection that the inventory does
+  not list, and tells its host (`RequestRedelivered`). A request delivered on the inventory's
+  own connection is left alone, as the inventory may predate it; one the wallet still lists
+  (it was only in the background) is not sent again;
+- a request delivered on the current connection is not sent there twice: if the host sends
+  it again too, the session confirms it without sending it.
+
+Each end keeps at most 200 requests, dropping the oldest. An incomplete inventory sends
+nothing again. Only `interactionId`, `items.discriminator` and the answer's `discriminator`
+are read; every other message passes through untouched.
+
 ## 8. Security considerations
 
 **What protects the link.** Possession of `P`. An attacker without `P` cannot compute

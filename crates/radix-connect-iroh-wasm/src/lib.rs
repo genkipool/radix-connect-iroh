@@ -28,6 +28,10 @@ export type IrohConnectionState = 'connecting' | 'connected' | 'disconnected'
 export type IrohSessionEvent =
   | { type: 'stateChanged'; state: IrohConnectionState }
   | { type: 'message'; message: string }
+  /** A request the wallet lost with its app was delivered to it again. */
+  | { type: 'requestRedelivered'; interactionId: string }
+  /** The wallet's app went to the background, or came back. */
+  | { type: 'peerPresence'; inBackground: boolean }
 export type IrohErrorCode =
   | 'invalidPassword'
   | 'invalidRelayUrl'
@@ -120,15 +124,21 @@ fn state_name(state: core::ConnectionState) -> &'static str {
 
 fn event_to_js(event: core::SessionEvent) -> JsValue {
     let object = Object::new();
-    let (kind, key, value) = match event {
+    let (kind, key, value): (&str, &str, JsValue) = match event {
         core::SessionEvent::StateChanged(state) => {
-            ("stateChanged", "state", state_name(state).to_owned())
+            ("stateChanged", "state", state_name(state).into())
         }
-        core::SessionEvent::Message(message) => ("message", "message", message),
+        core::SessionEvent::Message(message) => ("message", "message", message.into()),
+        core::SessionEvent::RequestRedelivered(id) => {
+            ("requestRedelivered", "interactionId", id.into())
+        }
+        core::SessionEvent::PeerPresence { in_background } => {
+            ("peerPresence", "inBackground", in_background.into())
+        }
     };
     // Setting properties on a fresh plain object cannot fail.
     let _ = Reflect::set(&object, &"type".into(), &kind.into());
-    let _ = Reflect::set(&object, &key.into(), &value.into());
+    let _ = Reflect::set(&object, &key.into(), &value);
     object.into()
 }
 
@@ -252,6 +262,13 @@ impl IrohSession {
     }
 
     /// A snapshot of the connectivity, for logs and diagnostics screens. Cheap.
+    /// Connector: whether the wallet reports the requests it holds, so one it lost with
+    /// its app comes back by itself (a `requestRedelivered` event).
+    #[wasm_bindgen(js_name = peerReportsRequests)]
+    pub fn peer_reports_requests(&self) -> bool {
+        self.session.peer_reports_requests()
+    }
+
     #[wasm_bindgen(unchecked_return_type = "IrohDiagnostics")]
     pub fn diagnostics(&self) -> JsValue {
         diagnostics_to_js(self.session.diagnostics())

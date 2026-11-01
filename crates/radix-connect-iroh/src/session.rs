@@ -31,12 +31,16 @@ use crate::protocol::{
     Sent,
 };
 use crate::relay_health::{self, RelayNotice};
+use crate::requests::{self, Delivered, Held};
 use crate::{ConnectionPassword, Error, Role, SendError, SessionConfig};
 
 /// Messages waiting for the host. Normally at most one: the next message is only read
 /// once the host took the previous one (a replaced connection may leave one behind,
 /// which is then withdrawn).
 const MESSAGE_BUFFER: usize = 4;
+/// Notices for the host (requests delivered again, the wallet's presence): few, and each
+/// one small. One that finds the buffer full is dropped: the next one says more.
+const NOTICE_BUFFER: usize = 32;
 
 /// How long creating the local endpoint may take.
 const BIND_TIMEOUT: Duration = Duration::from_secs(15);
@@ -123,6 +127,22 @@ pub enum SessionEvent {
     /// A message arrived from the peer. Taking it from
     /// [`next_event`](Session::next_event) confirms it to the peer.
     Message(String),
+    /// Connector: a dApp request (by `interactionId`) the wallet had received and lost —
+    /// its app was closed — was delivered to it again, and it confirmed it. See
+    /// `docs/PROTOCOL.md`, "Request inventory".
+    RequestRedelivered(String),
+    /// Connector: the wallet's app went to the background (`true`) or came back.
+    PeerPresence {
+        /// Whether the wallet's app is in the background.
+        in_background: bool,
+    },
+}
+
+/// What the session tells the host besides states and messages.
+#[derive(Debug)]
+enum Notice {
+    Redelivered(String),
+    Presence(bool),
 }
 
 /// A message waiting for the host. `taken` tells the stream that brought it to confirm
@@ -142,6 +162,7 @@ struct Delivery {
 #[derive(Debug)]
 struct Inbox {
     messages: mpsc::Receiver<Delivery>,
+    notices: mpsc::Receiver<Notice>,
     state: watch::Receiver<ConnectionState>,
     reported: ConnectionState,
 }
@@ -229,6 +250,13 @@ struct Shared {
     in_background: AtomicBool,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
+    /// Wallet: the requests its host took and has not answered, for the inventory.
+    held: std::sync::Mutex<Held>,
+    /// Connector: the requests it delivered that the wallet has not answered.
+    delivered: Arc<std::sync::Mutex<Delivered>>,
+    /// Connector: whether the wallet sends inventories, so lost requests come back.
+    peer_reports_requests: AtomicBool,
+    notices: mpsc::Sender<Notice>,
 }
 
 /// The parts of [`Diagnostics`] that iroh does not keep for us.
@@ -320,6 +348,7 @@ impl Session {
             Role::Connector => ConnectionState::Disconnected,
         };
         let (messages_tx, messages_rx) = mpsc::channel(MESSAGE_BUFFER);
+        let (notices_tx, notices_rx) = mpsc::channel(NOTICE_BUFFER);
         let shared = Arc::new(Shared {
             endpoint,
             role,
@@ -344,6 +373,10 @@ impl Session {
             unauthorized,
             in_background: AtomicBool::new(false),
             peer_in_background: AtomicBool::new(false),
+            held: std::sync::Mutex::default(),
+            delivered: Arc::default(),
+            peer_reports_requests: AtomicBool::new(false),
+            notices: notices_tx,
         });
         span.in_scope(|| {
             let config = &shared.config;
@@ -365,6 +398,7 @@ impl Session {
         let driver = AbortOnDropHandle::new(task::spawn(drive(shared.clone()).instrument(span)));
         let inbox = Inbox {
             messages: messages_rx,
+            notices: notices_rx,
             state: shared.state.subscribe(),
             reported: initial_state,
         };
@@ -457,6 +491,13 @@ impl Session {
         self.shared.peer_in_background.load(Ordering::Relaxed)
     }
 
+    /// Connector: whether the wallet tells which requests it still has when it connects,
+    /// so one it lost is delivered again by itself ([`SessionEvent::RequestRedelivered`]).
+    /// `false` until it first does, and for a wallet that predates it.
+    pub fn peer_reports_requests(&self) -> bool {
+        self.shared.peer_reports_requests.load(Ordering::Relaxed)
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.shared.diagnostics()
     }
@@ -473,6 +514,7 @@ impl Session {
         let mut inbox = self.inbox.lock().await;
         let Inbox {
             messages,
+            notices,
             state,
             reported,
         } = &mut *inbox;
@@ -489,6 +531,12 @@ impl Session {
                         return Some(SessionEvent::StateChanged(latest));
                     }
                 }
+                Some(notice) = notices.recv() => {
+                    return Some(match notice {
+                        Notice::Redelivered(id) => SessionEvent::RequestRedelivered(id),
+                        Notice::Presence(in_background) => SessionEvent::PeerPresence { in_background },
+                    });
+                }
                 delivery = messages.recv() => {
                     let Delivery { message, taken, seq, queued_at } = delivery?;
                     // If the stream that brought the message is gone (the peer gave up
@@ -496,6 +544,7 @@ impl Session {
                     // will send it again if it still matters: delivering it now could
                     // duplicate it. Owed from now on, so that closing waits for it.
                     if taken.send(OwedConfirmation::new(&self.shared.acks_in_flight)).is_ok() {
+                        self.shared.took(&message);
                         tracing::debug!(
                             parent: span,
                             recv_seq = seq,
@@ -608,11 +657,84 @@ impl Shared {
             return;
         }
         tracing::debug!(in_background, "told the peer the app's presence");
+        let inventory = self.lock_held().inventory();
+        let _ = connection.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
         let again = connection.clone();
         task::spawn(async move {
             time::sleep(Duration::from_millis(250)).await;
             let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&datagram));
+            let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
         });
+    }
+
+    fn lock_held(&self) -> std::sync::MutexGuard<'_, Held> {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn lock_delivered(&self) -> std::sync::MutexGuard<'_, Delivered> {
+        self.delivered
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The host took `message` from the peer.
+    fn took(&self, message: &str) {
+        match self.role {
+            Role::Wallet => self.lock_held().took(message),
+            Role::Connector => self.lock_delivered().took(message),
+        }
+    }
+
+    /// The peer confirmed `message`, sent on connection `number`.
+    fn confirmed(&self, message: &str, number: u64) {
+        match self.role {
+            Role::Wallet => self.lock_held().sent(message),
+            Role::Connector => self.lock_delivered().sent(message, number),
+        }
+    }
+
+    /// Connector: the wallet's inventory arrived on `current`. Each request it lost is
+    /// delivered again there, in the background.
+    fn heard_inventory(&self, current: &Current, inventory: &requests::Inventory) {
+        if !self.peer_reports_requests.swap(true, Ordering::Relaxed) {
+            tracing::info!("the wallet reports the requests it holds: lost ones come back");
+        }
+        let lost = self.lock_delivered().lost(inventory, current.number);
+        for (id, message) in lost {
+            tracing::info!(
+                held = inventory.digests.len(),
+                "the wallet lost a request it had received (its app was closed): sending it again"
+            );
+            let connection = current.connection.clone();
+            let notices = self.notices.clone();
+            let config = self.config.clone();
+            let span = current.span.clone();
+            task::spawn(
+                async move {
+                    match protocol::send_message(
+                        &connection,
+                        &message,
+                        config.max_message_size,
+                        config.receive_timeout,
+                        config.ack_timeout,
+                    )
+                    .await
+                    {
+                        Ok(_) => {
+                            tracing::info!("the wallet confirmed the request sent again");
+                            let _ = notices.try_send(Notice::Redelivered(id));
+                        }
+                        Err(failure) => tracing::warn!(
+                            error = %failure.error,
+                            "could not send again a request the wallet lost: the next connection will"
+                        ),
+                    }
+                }
+                .instrument(span),
+            );
+        }
     }
 
     /// Connector: what the wallet said of its app.
@@ -621,6 +743,7 @@ impl Shared {
             .peer_in_background
             .swap(in_background, Ordering::Relaxed);
         if before != in_background {
+            let _ = self.notices.try_send(Notice::Presence(in_background));
             tracing::info!(
                 in_background,
                 "the wallet says its app is {}",
@@ -666,6 +789,14 @@ impl Shared {
             return Err(SendError::NotConnected);
         };
         tracing::Span::current().record("conn", current.number);
+        if self.role == Role::Connector && self.lock_delivered().already_on(message, current.number)
+        {
+            tracing::info!(
+                bytes,
+                "not sent: the wallet got this request again on this connection already"
+            );
+            return Ok(());
+        }
         tracing::debug!(bytes, "sending a message");
         let started = Instant::now();
         let mut cancelled = CancelledSend {
@@ -694,6 +825,7 @@ impl Shared {
                     total_ms = ms(started.elapsed()),
                     "message confirmed by the peer"
                 );
+                self.confirmed(message, current.number);
                 Ok(())
             }
             Err(SendFailure {
@@ -2160,10 +2292,17 @@ async fn serve_streams(shared: &Shared, current: &Current) -> Option<String> {
             }
             stream = connection.accept_bi() => stream,
             datagram = connection.read_datagram(), if datagrams => {
-                match datagram.as_deref().ok().map(protocol::read_presence) {
-                    Some(Some(in_background)) => shared.heard_presence(in_background),
-                    Some(None) => tracing::debug!("ignored a datagram that is not a presence one"),
-                    None => datagrams = false,
+                match datagram.as_deref() {
+                    Ok(bytes) => {
+                        if let Some(in_background) = protocol::read_presence(bytes) {
+                            shared.heard_presence(in_background);
+                        } else if let Some(inventory) = requests::read_inventory(bytes) {
+                            shared.heard_inventory(current, &inventory);
+                        } else {
+                            tracing::debug!("ignored a datagram of an unknown kind");
+                        }
+                    }
+                    Err(_) => datagrams = false,
                 }
                 continue;
             }
