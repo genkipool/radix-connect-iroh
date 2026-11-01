@@ -224,7 +224,8 @@ impl Delivered {
         }
     }
 
-    fn forget(&mut self, id: &str) {
+    /// The host cancelled request `id`: it is not delivered again.
+    pub(crate) fn forget(&mut self, id: &str) {
         if self.requests.remove(id).is_some() {
             self.order.retain(|noted| noted != id);
         }
@@ -337,6 +338,21 @@ mod tests {
             digests: HashSet::new(),
         };
         assert!(delivered.lost(&incomplete, 2).is_empty());
+    }
+
+    #[test]
+    fn a_request_the_host_cancelled_is_not_sent_again() {
+        let mut delivered = Delivered::default();
+        delivered.sent(&request("cancelled"), 1);
+        delivered.sent(&request("kept"), 1);
+
+        delivered.forget("cancelled");
+
+        let empty = read_inventory(&inventory(std::iter::empty::<&String>())).unwrap();
+        assert_eq!(
+            delivered.lost(&empty, 2),
+            vec![("kept".to_owned(), request("kept"))]
+        );
     }
 
     #[test]

@@ -264,7 +264,9 @@ connector find out when the wallet is back:
   confirmed, or the dApp cancels it (`items.discriminator` `cancelRequest`). The list lives
   in the app's process: it is lost exactly when the requests are;
 - the connector's session keeps each request it delivered, with the connection it was
-  delivered on, until the wallet answers it or the dApp cancels it;
+  delivered on, until the wallet answers it, or the dApp or its host cancels it (the host
+  calls `forget_request` — since 0.1.8 — when the dApp or the person gives up on a request
+  sent while the wallet was away: a wallet opened later does not show it);
 - on a complete inventory, the connector delivers again, on that connection and with the
   same message, each request delivered on an **earlier** connection that the inventory does
   not list, and tells its host (`RequestRedelivered`). A request delivered on the inventory's

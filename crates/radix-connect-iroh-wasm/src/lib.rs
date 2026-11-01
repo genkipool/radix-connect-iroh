@@ -269,6 +269,13 @@ impl IrohSession {
         self.session.peer_reports_requests()
     }
 
+    /// Connector: the dApp request `interactionId` was cancelled: it is not delivered
+    /// again to a wallet that lost it with its app.
+    #[wasm_bindgen(js_name = forgetRequest)]
+    pub fn forget_request(&self, #[wasm_bindgen(js_name = interactionId)] interaction_id: String) {
+        self.session.forget_request(&interaction_id);
+    }
+
     #[wasm_bindgen(unchecked_return_type = "IrohDiagnostics")]
     pub fn diagnostics(&self) -> JsValue {
         diagnostics_to_js(self.session.diagnostics())

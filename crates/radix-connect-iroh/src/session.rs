@@ -507,6 +507,16 @@ impl Session {
         self.shared.peer_reports_requests.load(Ordering::Relaxed)
     }
 
+    /// Connector: the host cancelled the dApp request `interaction_id` (its dApp, or the
+    /// person, gave up on it). It is no longer delivered again to a wallet that lost it: a
+    /// wallet opened later does not show a request nobody waits for. A request the wallet
+    /// still holds stays there; only the wallet can end it.
+    pub fn forget_request(&self, interaction_id: &str) {
+        if self.shared.role == Role::Connector {
+            self.shared.lock_delivered().forget(interaction_id);
+        }
+    }
+
     pub fn diagnostics(&self) -> Diagnostics {
         self.shared.diagnostics()
     }
