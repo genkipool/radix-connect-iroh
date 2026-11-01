@@ -273,6 +273,12 @@ connector find out when the wallet is back:
 - a request delivered on the current connection is not sent there twice: if the host sends
   it again too, the session confirms it without sending it.
 
+While the wallet says its app is in the background, the connector checks every 5 s that it
+still answers (since 0.1.6), with the same probe as after a network change, and drops the
+connection when it does not: a wallet closed from the background is known gone within
+about 10 s instead of QUIC's 30. A wallet the system only froze fails it too, which loses
+nothing — it lists its requests when it is back, and redials then.
+
 Each end keeps at most 200 requests, dropping the oldest. An incomplete inventory sends
 nothing again. Only `interactionId`, `items.discriminator` and the answer's `discriminator`
 are read; every other message passes through untouched.

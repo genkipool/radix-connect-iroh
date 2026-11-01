@@ -293,6 +293,46 @@ async fn the_connector_hears_whether_the_wallet_app_is_in_the_background() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_closed_from_the_background_is_known_gone_within_seconds() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(35);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    wallet.set_in_background(true);
+    heard(&connector, true).await;
+
+    // The system ends the app: nothing is said, and only QUIC's idle timeout (30 s) would tell.
+    let ended = Instant::now();
+    drop(wallet);
+    time::timeout(
+        BACKGROUND_PROBE_INTERVAL + PROBE_MAX_DEADLINE + Duration::from_secs(3),
+        wait_for_state(&connector, ConnectionState::Disconnected),
+    )
+    .await
+    .expect("the connector still believed the wallet connected");
+    assert!(ended.elapsed() < Duration::from_secs(15));
+    connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_in_the_background_that_still_answers_stays_connected() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(36);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    wallet.set_in_background(true);
+    heard(&connector, true).await;
+
+    // Two periodic checks, both answered.
+    time::sleep(BACKGROUND_PROBE_INTERVAL * 2 + Duration::from_secs(1)).await;
+
+    assert_eq!(connector.state(), ConnectionState::Connected);
+    deliver(&connector, &wallet, "{\"still\":\"here\"}")
+        .await
+        .unwrap();
+    wallet.close().await;
+    connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_wallet_in_the_background_says_so_on_every_new_connection() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(32);

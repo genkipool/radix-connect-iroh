@@ -90,6 +90,12 @@ const PROBE_MAX_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Network changes reported within this long of a liveness check share the next one.
 const PROBE_DEBOUNCE: Duration = Duration::from_secs(2);
+/// Connector: how often it checks that a wallet whose app is in the background still
+/// answers. Closed from there, the app sends nothing, and only QUIC's idle timeout (30 s)
+/// would tell; checked, it is known within this plus a check's deadline. A wallet the
+/// system only froze fails the check too, which loses nothing: it lists its requests when
+/// it is back (`requests`), and redials then.
+const BACKGROUND_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Why a connection the peer stopped answering ended.
 const NO_ANSWER: &str = "no answer to a liveness check";
@@ -250,6 +256,9 @@ struct Shared {
     in_background: AtomicBool,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
+    /// Connector: bumped when the wallet's app goes to the background or comes back, so the
+    /// liveness checks start or stop at once.
+    presence: watch::Sender<u64>,
     /// Wallet: the requests its host took and has not answered, for the inventory.
     held: std::sync::Mutex<Held>,
     /// Connector: the requests it delivered that the wallet has not answered.
@@ -373,6 +382,7 @@ impl Session {
             unauthorized,
             in_background: AtomicBool::new(false),
             peer_in_background: AtomicBool::new(false),
+            presence: watch::Sender::new(0),
             held: std::sync::Mutex::default(),
             delivered: Arc::default(),
             peer_reports_requests: AtomicBool::new(false),
@@ -743,6 +753,7 @@ impl Shared {
             .peer_in_background
             .swap(in_background, Ordering::Relaxed);
         if before != in_background {
+            self.presence.send_modify(|changes| *changes += 1);
             let _ = self.notices.try_send(Notice::Presence(in_background));
             tracing::info!(
                 in_background,
@@ -2187,10 +2198,24 @@ async fn check_liveness(shared: &Shared, current: &Current) -> Ended {
     // Changes reported before the connection existed are no reason to check it; one
     // reported since is, even if this task only starts now.
     let mut pending = *requests.borrow_and_update() != current.network;
+    let mut presence = shared.presence.subscribe();
     let mut last: Option<Instant> = None;
     loop {
-        if !std::mem::take(&mut pending) && requests.changed().await.is_err() {
-            std::future::pending::<()>().await;
+        let mut why = "network_changed";
+        if !std::mem::take(&mut pending) {
+            // A network change, or — while the wallet's app is in the background — the next
+            // periodic check. A change of presence only starts or stops the period.
+            let in_background =
+                shared.role == Role::Connector && shared.peer_in_background.load(Ordering::Relaxed);
+            tokio::select! {
+                changed = requests.changed() => {
+                    if changed.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                }
+                () = time::sleep(BACKGROUND_PROBE_INTERVAL), if in_background => why = "app_in_background",
+                Ok(()) = presence.changed() => continue,
+            }
         }
         let now = Instant::now();
         if let Some(ready) = last.map(|last| last + PROBE_DEBOUNCE)
@@ -2209,15 +2234,31 @@ async fn check_liveness(shared: &Shared, current: &Current) -> Ended {
         let (path, rtt) = diagnostics::selected_path(connection);
         let relay_connected = shared.relay_connected();
         let deadline = probe_deadline(rtt, path, relay_connected);
-        tracing::info!(
-            why = "network_changed",
-            path = path.map(PathKind::as_str),
-            rtt_ms = rtt.map(ms),
-            relay_connected,
-            deadline_ms = ms(deadline),
-            "checking that the peer still answers"
-        );
+        // Every few seconds while the app is in the background: worth a debug line only.
+        let periodic = why != "network_changed";
+        if periodic {
+            tracing::debug!(
+                why,
+                path = path.map(PathKind::as_str),
+                rtt_ms = rtt.map(ms),
+                deadline_ms = ms(deadline),
+                "checking that the peer still answers"
+            );
+        } else {
+            tracing::info!(
+                why,
+                path = path.map(PathKind::as_str),
+                rtt_ms = rtt.map(ms),
+                relay_connected,
+                deadline_ms = ms(deadline),
+                "checking that the peer still answers"
+            );
+        }
         match protocol::probe(connection, deadline).await {
+            Liveness::Alive if periodic => tracing::debug!(
+                answer_ms = ms(started.elapsed()),
+                "the peer answered the liveness check"
+            ),
             Liveness::Alive => {
                 let (path, rtt) = diagnostics::selected_path(connection);
                 tracing::info!(
@@ -2238,6 +2279,7 @@ async fn check_liveness(shared: &Shared, current: &Current) -> Ended {
             }
             Liveness::Unresponsive => {
                 tracing::warn!(
+                    why,
                     deadline_ms = ms(deadline),
                     elapsed_ms = ms(started.elapsed()),
                     "the peer did not answer the liveness check: dropping the connection instead of waiting for it to time out"
