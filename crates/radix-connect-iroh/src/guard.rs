@@ -5,7 +5,7 @@ use iroh::{EndpointAddr, EndpointId};
 use n0_future::time::Instant;
 
 use crate::diagnostics::Tally;
-use crate::protocol::{ALPN, CloseCode, KNOCK_ALPN};
+use crate::protocol::{ALPN, CloseCode, KNOCK_ALPN, KNOCK_RESTARTED_ALPN};
 
 /// Restricts an endpoint to the single peer of its link.
 ///
@@ -29,7 +29,7 @@ impl PeerGuard {
 
     /// The peer only, with the protocol or a knock (each endpoint accepts only its role's).
     pub(crate) fn is_allowed(&self, remote: EndpointId, alpn: &[u8]) -> bool {
-        remote == self.peer && (alpn == ALPN || alpn == KNOCK_ALPN)
+        remote == self.peer && (alpn == ALPN || alpn == KNOCK_ALPN || alpn == KNOCK_RESTARTED_ALPN)
     }
 }
 

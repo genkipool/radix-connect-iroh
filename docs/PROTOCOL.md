@@ -80,7 +80,8 @@ Test vector — `P = cafe…cafe` (the two bytes `ca fe` repeated 16 times):
 Both sides install a hook that runs inside iroh for every connection:
 
 - before dialing: refuse any target other than the derived peer id or any ALPN other
-  than `radix-connect/iroh/1` and `radix-connect/iroh/knock/1` (§7.1);
+  than `radix-connect/iroh/1`, `radix-connect/iroh/knock/1` and
+  `radix-connect/iroh/knock-restarted/1` (§7.1);
 - after the handshake: close with application error `1` (`unauthorized`) any
   connection whose authenticated remote id is not the derived peer id.
 
@@ -100,8 +101,9 @@ Before any handshake work, the connector screens connection attempts:
   and the hook then rejects it. Filling that pool never keeps the wallet out, since its
   attempts through the relay use their own pool.
 
-The wallet's endpoint registers one ALPN, `radix-connect/iroh/knock/1`, for its connector's
-knocks (§7.1), and accepts nothing that carries messages.
+The wallet's endpoint registers two ALPNs for its connector's knocks (§7.1), in this order of
+preference: `radix-connect/iroh/knock-restarted/1` (since 0.1.9) and
+`radix-connect/iroh/knock/1`. It accepts nothing that carries messages.
 
 When an authenticated connection arrives while another one is active, the new one wins
 and the old one is closed with application error `2` (`replaced`): the wallet only
@@ -212,7 +214,8 @@ States: `connecting` (wallet dialing), `connected`, `disconnected`.
 
 Application error codes when closing a connection: `0` closed by its owner, `1`
 unauthorized (§5), `2` replaced by a newer connection (§5), `3` unresponsive (no answer
-to a liveness check), `4` knocked (§7.1). Peers describe codes they do not know
+to a liveness check), `4` knocked (§7.1), `5` the connector restarted (§7.1). Peers
+describe codes they do not know
 generically.
 
 ### 7.1 Knocks (since 0.1.2)
@@ -228,10 +231,18 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   turns anybody else away with error `1`), closes the connection at once with application
   error `4` (`knocked`), and treats it as a wake-up: a waiting dial goes now and the quick
   period starts again. Nothing travels over a knock.
-- A knock while the wallet is connected does nothing: a connection left over from a
-  connector process that ended does not linger, as the new process, holding the same key,
-  answers its packets with a QUIC reset. Knocks within 2 s of the last one that woke the
-  wallet wake it once; at most 4 knock handshakes are in progress at once.
+- A knock while the wallet is connected does nothing: it may come from a second process
+  holding the same link (two logins at once), and checking or cutting the connection then
+  lost the answer it carried. Knocks within 2 s of the last one that woke the wallet wake it
+  once; at most 4 knock handshakes are in progress at once.
+- A connector that is the **only holder** of its link (a browser extension; the host says so)
+  knocks as it starts with `radix-connect/iroh/knock-restarted/1` first and
+  `radix-connect/iroh/knock/1` as well (since 0.1.9). A process that ends closes nothing,
+  and over a relay its connection lingers on the wallet until QUIC's idle timeout (30 s), as
+  seen after reloading the extension. So a wallet that takes a restarted knock while connected
+  drops its connection, with error `5` (`restarted`), when it is at least 15 s old, and dials
+  at once; a younger one may be to the run that knocks (its knocks come within about 9 s of
+  its start), and stays. A wallet that predates it chooses the plain knock: nothing changes.
 - A wallet that predates knocks registers no ALPN and refuses the handshake; a connector
   that predates them never knocks. Either way the link works as before.
 - A pairing session does not knock: the wallet does not know the link before it scans the

@@ -214,12 +214,18 @@ impl IrohSession {
     /// `peerRelayUrl`: for a connector, the relay its wallet was last seen on (`peerRelay`,
     /// kept with the link): the session knocks there as it starts, and a wallet that is up
     /// connects at once. A wrong or unusable one only means no knock.
+    ///
+    /// `soleHolder`: for a connector that is the only holder of its links (an extension): as
+    /// it starts, a wallet still connected to an earlier run that ended without closing (a
+    /// reload) drops that connection and dials at once. Never for a link several processes
+    /// may hold at once.
     pub async fn start(
         password: Vec<u8>,
         #[wasm_bindgen(unchecked_param_type = "IrohRole")] role: String,
         #[wasm_bindgen(js_name = relayUrl)] relay_url: Option<String>,
         #[wasm_bindgen(js_name = ackTimeoutMs)] ack_timeout_ms: Option<u32>,
         #[wasm_bindgen(js_name = peerRelayUrl)] peer_relay_url: Option<String>,
+        #[wasm_bindgen(js_name = soleHolder)] sole_holder: Option<bool>,
     ) -> Result<IrohSession, JsValue> {
         let password = password_from(password)?;
         let role = role_from(&role)?;
@@ -233,6 +239,9 @@ impl IrohSession {
                 .clone()
                 .with_peer_relay(peer_relay_url)
                 .unwrap_or(config);
+        }
+        if sole_holder == Some(true) {
+            config = config.as_sole_holder();
         }
         install_subscriber();
         let session = core::Session::start(&password, role, config)

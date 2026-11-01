@@ -2159,6 +2159,108 @@ async fn closing_a_connector_never_waits_for_its_knocks() {
     );
 }
 
+/// A connector that is the link's only holder, and a wallet that drops an old connection on
+/// its restarted knock after `min_age` (15 s in production).
+fn sole_holder(relay_url: &RelayUrl) -> SessionConfig {
+    config(relay_url).as_sole_holder()
+}
+
+fn wallet_config(relay_url: &RelayUrl, min_age: Duration) -> SessionConfig {
+    let mut config = config(relay_url);
+    config.restarted_knock_min_age = Some(min_age);
+    config
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sole_holder_that_restarts_without_closing_gets_its_wallet_back_at_once() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(67);
+    let first = Session::start(&link, Role::Connector, sole_holder(&relay_url))
+        .await
+        .unwrap();
+    let wallet = Session::start(
+        &link,
+        Role::Wallet,
+        wallet_config(&relay_url, Duration::from_secs(1)),
+    )
+    .await
+    .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    time::sleep(Duration::from_secs(2)).await;
+
+    // The extension is reloaded: its run ends without closing anything, and a new one starts.
+    drop(first);
+    let started = Instant::now();
+    let second = Session::start(&link, Role::Connector, sole_holder(&relay_url))
+        .await
+        .unwrap();
+
+    assert!(
+        connected_within(&second, Duration::from_secs(8)).await,
+        "the wallet dropped its dead connection and dialed the new run, not after QUIC's 30 s"
+    );
+    logs.wait_for(
+        Level::INFO,
+        &["the connector restarted: its old connection is dead, dropping it and dialing now"],
+    )
+    .await;
+    deliver(&second, &wallet, "after a reload").await.unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    second.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restarted_knock_leaves_a_connection_made_since_the_restart() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(68);
+    let connector = Session::start(&link, Role::Connector, sole_holder(&relay_url))
+        .await
+        .unwrap();
+    // A young connection: it may be to the run that knocks.
+    let wallet = Session::start(
+        &link,
+        Role::Wallet,
+        wallet_config(&relay_url, Duration::from_secs(60)),
+    )
+    .await
+    .unwrap();
+    wait_for_state(&wallet, ConnectionState::Connected).await;
+    let connected_since = wallet.diagnostics().connected_for.unwrap();
+
+    let knocked = connector.knock(&relay_url).await;
+    let restarted = Session::start(&link, Role::Connector, sole_holder(&relay_url))
+        .await
+        .unwrap();
+    logs.wait_for(
+        Level::DEBUG,
+        &["the connector knocked while connected: nothing to do"],
+    )
+    .await;
+
+    assert!(knocked);
+    let still = wallet.diagnostics().connected_for.expect("still connected");
+    assert!(
+        still > connected_since,
+        "the same connection: {still:?} > {connected_since:?}"
+    );
+    let session = format!("session={} ", wallet.shared.session);
+    assert_eq!(
+        logs.count(Level::INFO, &["disconnected from the peer", &session]),
+        0,
+        "the wallet kept it"
+    );
+    restarted.close().await;
+    connector.close().await;
+    wallet.close().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_knock_from_a_second_holder_of_the_link_never_cuts_a_live_connection() {
     let logs = capture();

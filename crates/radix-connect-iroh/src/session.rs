@@ -27,8 +27,8 @@ use crate::diagnostics::{
 use crate::guard::PeerGuard;
 use crate::logging::Redacted;
 use crate::protocol::{
-    self, ALPN, Acknowledged, CloseCode, Incoming, KNOCK_ALPN, Liveness, SendFailure, SendPhase,
-    Sent,
+    self, ALPN, Acknowledged, CloseCode, Incoming, KNOCK_ALPN, KNOCK_RESTARTED_ALPN, Liveness,
+    SendFailure, SendPhase, Sent,
 };
 use crate::relay_health::{self, RelayNotice};
 use crate::requests::{self, Delivered, Held};
@@ -313,7 +313,8 @@ impl Session {
         // (its connector telling it to dial now), and no connection that carries anything.
         let alpns = match role {
             Role::Connector => vec![ALPN.to_vec()],
-            Role::Wallet => vec![KNOCK_ALPN.to_vec()],
+            // In order of preference: a connector offers both kinds of knock.
+            Role::Wallet => vec![KNOCK_RESTARTED_ALPN.to_vec(), KNOCK_ALPN.to_vec()],
         };
         let builder = Endpoint::builder(presets::Minimal)
             .secret_key(password.secret_key(role))
@@ -474,7 +475,7 @@ impl Session {
         if self.shared.role != Role::Connector {
             return false;
         }
-        knock(&self.shared, relay)
+        knock(&self.shared, relay, false)
             .instrument(self.shared.span.clone())
             .await
     }
@@ -1627,6 +1628,19 @@ const KNOCK_INITIAL_RTT: Duration = Duration::from_millis(100);
 /// Knocks closer together than this wake the wallet once: even its own connector cannot keep
 /// it dialing.
 const KNOCK_MIN_GAP: Duration = Duration::from_secs(2);
+/// Wallet: a connection at least this old is from before a connector that knocks as just
+/// restarted ([`KNOCK_RESTARTED_ALPN`]): its knocks come within the first
+/// `KNOCKS_AT` + `KNOCK_TIMEOUT` (9 s) of its start, so a younger one may be to the new run.
+const RESTARTED_KNOCK_MIN_AGE: Duration = Duration::from_secs(15);
+
+fn restarted_knock_min_age(config: &SessionConfig) -> Duration {
+    #[cfg(test)]
+    if let Some(age) = config.restarted_knock_min_age {
+        return age;
+    }
+    let _ = config;
+    RESTARTED_KNOCK_MIN_AGE
+}
 /// When a connector knocks after its session starts, while its wallet is not connected.
 const KNOCKS_AT: [Duration; 3] = [
     Duration::ZERO,
@@ -1658,9 +1672,14 @@ async fn answer_knocks(shared: &Shared) {
             Some(knock) = handshakes.next(), if !handshakes.is_empty() => {
                 let knock: Result<Result<Connection, ConnectingError>, _> = knock;
                 match knock {
-                    Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN => {
+                    Ok(Ok(connection)) if connection.alpn() == KNOCK_ALPN || connection.alpn() == KNOCK_RESTARTED_ALPN => {
+                        let restarted = connection.alpn() == KNOCK_RESTARTED_ALPN;
                         connection.close(CloseCode::Knocked.into(), b"dialing");
                         let now = Instant::now();
+                        let stale = restarted
+                            .then(|| shared.connection.borrow().clone())
+                            .flatten()
+                            .filter(|current| current.connected_at.elapsed() >= restarted_knock_min_age(&shared.config));
                         // Connected already: nothing to wake, and nothing to check. A knock
                         // while connected comes from another process holding the same link (two
                         // logins at once, say) or from a connector that restarted without closing
@@ -1668,7 +1687,18 @@ async fn answer_knocks(shared: &Shared) {
                         // holders the check fails on a live connection, and cutting it loses what
                         // it carries — a signature the person just approved. A dead connection
                         // ends on its own (QUIC's idle timeout) and the wallet redials then.
-                        if *shared.state.borrow() == ConnectionState::Connected {
+                        if let Some(current) = stale {
+                            // The only holder of the link just started: the connection is to
+                            // its earlier run, which ended without closing it. One made since it
+                            // started (to an earlier knock of the same start) is younger than
+                            // `RESTARTED_KNOCK_MIN_AGE`, and stays.
+                            tracing::info!(
+                                conn = current.number,
+                                connected_ms = ms(current.connected_at.elapsed()),
+                                "the connector restarted: its old connection is dead, dropping it and dialing now"
+                            );
+                            current.connection.close(CloseCode::Restarted.into(), b"connector restarted");
+                        } else if *shared.state.borrow() == ConnectionState::Connected {
                             tracing::debug!("the connector knocked while connected: nothing to do");
                         } else if last_wake.is_some_and(|last| now.duration_since(last) < KNOCK_MIN_GAP) {
                             tracing::debug!("the connector knocked again moments after: already dialing");
@@ -1745,29 +1775,36 @@ async fn knock_on_start(shared: &Shared) {
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
-            _ = knock(shared, &relay) => {}
+            _ = knock(shared, &relay, shared.config.sole_holder) => {}
         }
     }
 }
 
-/// One knock at `relay`: whether the wallet took it.
-async fn knock(shared: &Shared, relay: &RelayUrl) -> bool {
+/// One knock at `relay`: whether the wallet took it. `restarted`: this connector just started
+/// and is its link's only holder ([`KNOCK_RESTARTED_ALPN`]).
+async fn knock(shared: &Shared, relay: &RelayUrl, restarted: bool) -> bool {
     let started = Instant::now();
     let addr = EndpointAddr::new(shared.peer).with_relay_url(relay.clone());
     // Its own transport settings: an initial RTT close to a relay's, not QUIC's 333 ms guess, so
     // a knock retries quickly while the wallet is not up, and a knock abandoned when the session
     // closes drains in a fraction of a second instead of holding up the endpoint for 3.
-    let options = ConnectOptions::new().with_transport_config(
+    let mut options = ConnectOptions::new().with_transport_config(
         QuicTransportConfig::builder()
             .initial_rtt(KNOCK_INITIAL_RTT)
             .max_concurrent_bidi_streams(0u32.into())
             .max_concurrent_uni_streams(0u32.into())
             .build(),
     );
+    let alpn = if restarted {
+        options = options.with_additional_alpns(vec![KNOCK_ALPN.to_vec()]);
+        KNOCK_RESTARTED_ALPN
+    } else {
+        KNOCK_ALPN
+    };
     let knocking = async {
         shared
             .endpoint
-            .connect_with_opts(addr, KNOCK_ALPN, options)
+            .connect_with_opts(addr, alpn, options)
             .await
             .map_err(|error| Redacted(error).to_string())?
             .await

@@ -36,6 +36,12 @@ pub const ALPN: &[u8] = b"radix-connect/iroh/1";
 /// handshake (which proves the connector's key) is done. A wallet that predates it refuses it.
 pub const KNOCK_ALPN: &[u8] = b"radix-connect/iroh/knock/1";
 
+/// ALPN of a knock from a connector that just started and is the only holder of its link (a
+/// browser extension): a connection the wallet still has to it is from before it started, and
+/// dead (a process that is ended closes nothing). The connector offers it first, with
+/// [`KNOCK_ALPN`] as well, so a wallet that predates it takes the knock as a plain one.
+pub const KNOCK_RESTARTED_ALPN: &[u8] = b"radix-connect/iroh/knock-restarted/1";
+
 /// First byte of a presence datagram: the wallet says whether its app is in the background.
 ///
 /// Datagrams carry nothing else, and only from the wallet: a connector reads them to tell a
@@ -81,6 +87,8 @@ pub(crate) enum CloseCode {
     Unresponsive = 3,
     /// A knock, taken: the wallet dials the connector now.
     Knocked = 4,
+    /// The connector restarted: this connection is from before, and dead.
+    Restarted = 5,
 }
 
 impl From<CloseCode> for VarInt {

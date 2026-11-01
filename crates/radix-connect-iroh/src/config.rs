@@ -80,12 +80,17 @@ pub struct SessionConfig {
     pub(crate) peer_relay: Option<RelayUrl>,
     /// Whether a connector knocks when its session starts (see [`SessionConfig::without_knocks`]).
     pub(crate) knocks: bool,
+    /// The connector is the only holder of its link: see [`SessionConfig::as_sole_holder`].
+    pub(crate) sole_holder: bool,
     /// Tests run a relay with a self-signed certificate.
     #[cfg(test)]
     pub(crate) insecure_skip_relay_cert_verify: bool,
     /// Tests use it to reproduce the browser, where only the relay is reachable.
     #[cfg(test)]
     pub(crate) relay_only: bool,
+    /// Tests shorten how old a connection must be for a restarted knock to drop it.
+    #[cfg(test)]
+    pub(crate) restarted_knock_min_age: Option<std::time::Duration>,
 
     /// Tests run [`Relays::Public`] against a local relay and pkarr server.
     #[cfg(test)]
@@ -145,10 +150,13 @@ impl SessionConfig {
             host_slow_after: DEFAULT_HOST_SLOW_AFTER,
             peer_relay: None,
             knocks: true,
+            sole_holder: false,
             #[cfg(test)]
             insecure_skip_relay_cert_verify: false,
             #[cfg(test)]
             relay_only: false,
+            #[cfg(test)]
+            restarted_knock_min_age: None,
 
             #[cfg(test)]
             test_public_infrastructure: None,
@@ -187,6 +195,16 @@ impl SessionConfig {
         self
     }
 
+    /// A connector that is the only holder of its link, such as a browser extension (its links
+    /// are its own): when its session starts it tells the wallet so in its knocks, and a wallet
+    /// still connected to it drops that connection, from an earlier run that ended without
+    /// closing it (a reloaded extension), and dials at once instead of waiting for QUIC's idle
+    /// timeout (30 s). Never for a link several processes may hold at once: a second one's start
+    /// would cut the first one's live connection.
+    pub fn as_sole_holder(mut self) -> Self {
+        self.sole_holder = true;
+        self
+    }
     /// The relays this session uses.
     pub fn relays(&self) -> &Relays {
         &self.relays
