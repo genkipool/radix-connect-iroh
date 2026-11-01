@@ -304,12 +304,31 @@ async fn a_wallet_closed_from_the_background_is_known_gone_within_seconds() {
     let ended = Instant::now();
     drop(wallet);
     time::timeout(
-        BACKGROUND_PROBE_INTERVAL + PROBE_MAX_DEADLINE + Duration::from_secs(3),
+        PERIODIC_PROBE_INTERVAL + PERIODIC_PROBE_DEADLINE + Duration::from_secs(3),
         wait_for_state(&connector, ConnectionState::Disconnected),
     )
     .await
     .expect("the connector still believed the wallet connected");
     assert!(ended.elapsed() < Duration::from_secs(15));
+    connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_closed_in_the_foreground_is_known_gone_within_seconds_too() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(37);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+
+    // Closed from the recent apps without ever saying it went to the background.
+    let ended = Instant::now();
+    drop(wallet);
+    time::timeout(
+        PERIODIC_PROBE_INTERVAL + PERIODIC_PROBE_DEADLINE + Duration::from_secs(3),
+        wait_for_state(&connector, ConnectionState::Disconnected),
+    )
+    .await
+    .expect("the connector still believed the wallet connected");
+    assert!(ended.elapsed() < Duration::from_secs(12));
     connector.close().await;
 }
 
@@ -322,7 +341,7 @@ async fn a_wallet_in_the_background_that_still_answers_stays_connected() {
     heard(&connector, true).await;
 
     // Two periodic checks, both answered.
-    time::sleep(BACKGROUND_PROBE_INTERVAL * 2 + Duration::from_secs(1)).await;
+    time::sleep(PERIODIC_PROBE_INTERVAL * 2 + Duration::from_secs(1)).await;
 
     assert_eq!(connector.state(), ConnectionState::Connected);
     deliver(&connector, &wallet, "{\"still\":\"here\"}")

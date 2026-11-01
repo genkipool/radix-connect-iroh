@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.91"
 license = "Apache-2.0"
@@ -15,7 +15,7 @@ repository = "https://github.com/genkipool/radix-connect-iroh"
 authors = ["Luis Alberto Reoyo Bolaños <68571366+genkipool@users.noreply.github.com>"]
 
 [workspace.dependencies]
-radix-connect-iroh = { path = "crates/radix-connect-iroh", version = "0.1.6" }
+radix-connect-iroh = { path = "crates/radix-connect-iroh", version = "0.1.7" }
 
 # `default-features = false` drops metrics, the UPnP/NAT-PMP port mapper and the Apple
 # datapath: none of them is needed to reach a relay, and the port mapper does not build
