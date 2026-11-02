@@ -97,6 +97,9 @@ pub(super) async fn answer_knocks(shared: &Shared) {
                                 connected_ms = ms(current.connected_at.elapsed()),
                                 "the connector restarted: its old connection is dead, dropping it and dialing now"
                             );
+                            // Counted as a knock: the dial loop, seeing it when the connection
+                            // ends, dials at once instead of after the usual pause.
+                            shared.knocks.send_modify(|knocks| *knocks = knocks.wrapping_add(1));
                             current.connection.close(CloseCode::Restarted.into(), b"connector restarted");
                         } else if *shared.state.borrow() == ConnectionState::Connected {
                             tracing::debug!("the connector knocked while connected: nothing to do");

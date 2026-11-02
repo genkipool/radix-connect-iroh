@@ -2354,6 +2354,16 @@ async fn a_sole_holder_that_restarts_without_closing_gets_its_wallet_back_at_onc
         &["the connector restarted: its old connection is dead, dropping it and dialing now"],
     )
     .await;
+    // At once, not after the pause that follows an ordinary disconnection.
+    logs.wait_for(
+        Level::DEBUG,
+        &[
+            "waiting before dialing again",
+            "delay_ms=0",
+            "reason=knocked",
+        ],
+    )
+    .await;
     deliver(&second, &wallet, "after a reload").await.unwrap();
     assert!(
         started.elapsed() < Duration::from_secs(8),

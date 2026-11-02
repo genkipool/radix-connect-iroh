@@ -26,7 +26,7 @@ pub(super) const MAX_REPLACED_DELAY: Duration = Duration::from_secs(300);
 pub(super) const UNREACHABLE_WARNING: Duration = Duration::from_secs(60);
 
 /// Why the wallet dials (again), for logs.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum DialReason {
     /// The session just started.
     First,
@@ -107,6 +107,9 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
                 shared.record_connected();
                 shared.set_state(ConnectionState::Connected);
                 shared.log_connected(&current, elapsed, Some(attempt));
+                // Knocks heard before this connection woke this dial: from now on a knock is
+                // the restarted connector's (see below).
+                knocks.mark_unchanged();
                 // Every connection starts as the app's: the connector hears where it is now.
                 shared.tell_presence(&current.connection);
                 // `None`: the session is closing, and closes the connection itself.
@@ -129,9 +132,16 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
                 network.mark_unchanged();
                 unreachable_since = Instant::now();
                 retry = Retry::new(unreachable_since, shared.retry_policy());
+                // A knock while connected only counts when the connector restarted, and the
+                // connection ended for it: the connector is up and waits, dial it at once.
+                let knocked = knocks.has_changed().unwrap_or(false);
+                knocks.mark_unchanged();
                 if was_replaced(&connection) {
                     replaced_in_a_row += 1;
                     reason = DialReason::Replaced;
+                } else if knocked {
+                    replaced_in_a_row = 0;
+                    reason = DialReason::Knocked;
                 } else {
                     replaced_in_a_row = 0;
                     reason = if unresponsive {
@@ -140,9 +150,9 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
                         DialReason::Disconnected
                     };
                 }
-                delay = if unresponsive {
-                    // The network changed under it: the connector is likely reachable
-                    // again right away.
+                delay = if unresponsive || reason == DialReason::Knocked {
+                    // The network changed under it, or the connector restarted: it is likely
+                    // (or knowingly) reachable again right away.
                     Duration::ZERO
                 } else {
                     delay_after_connection(replaced_in_a_row, &shared.config)
