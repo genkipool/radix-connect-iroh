@@ -186,6 +186,9 @@ struct Shared {
     /// Wallet: bumped on every knock it took (a wake-up too, which also bumps `network`),
     /// so the dial loop can say why it dials now.
     knocks: watch::Sender<u64>,
+    /// Bumped each time this end reconnects to its relay after losing it (the computer woke
+    /// from sleep, the network came back): a connector then knocks for its wallet again.
+    relay_regained: watch::Sender<u64>,
     /// Confirmations owed to the peer: for messages the host took, until they are
     /// written and acknowledged. Closing waits for them briefly so that a message the
     /// host took is not reported as lost.
@@ -332,6 +335,7 @@ impl Session {
             messages: messages_tx,
             network: watch::Sender::new(0),
             knocks: watch::Sender::new(0),
+            relay_regained: watch::Sender::new(0),
             acks_in_flight: Arc::new(watch::Sender::new(0)),
             trouble: std::sync::Mutex::default(),
             connections: AtomicU64::new(0),
@@ -1120,8 +1124,12 @@ async fn drive(shared: Arc<Shared>) {
                 None
             }
             Role::Connector => {
-                // Side by side: the knocks end within seconds, the session is the accept loop.
-                let (serving, ()) = tokio::join!(accept(&shared), knock_on_start(&shared));
+                // Side by side: the session is the accept loop; the knocks on start end within
+                // seconds, and those after a relay outage when the session closes.
+                let knocking = async {
+                    tokio::join!(knock_on_start(&shared), knock_when_relay_returns(&shared));
+                };
+                let (serving, ()) = tokio::join!(accept(&shared), knocking);
                 serving
             }
         }
@@ -1146,7 +1154,7 @@ mod relay_watch;
 use accept::accept;
 use dial::dial;
 use endpoint::{RelaysField, with_relays};
-use knocks::{answer_knocks, knock, knock_on_start};
+use knocks::{answer_knocks, knock, knock_on_start, knock_when_relay_returns};
 use receive::OwedConfirmation;
 use relay_watch::watch_relay;
 

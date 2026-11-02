@@ -243,6 +243,15 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   drops its connection, with error `5` (`restarted`), when it is at least 15 s old, and dials
   at once (since 0.1.10 without the usual pause after a disconnection); a younger one may be to the run that knocks (its knocks come within about 9 s of
   its start), and stays. A wallet that predates it chooses the plain knock: nothing changes.
+- A connector also knocks when it gets its relay back after losing it while the wallet is not
+  connected (since 0.1.11): the computer woke from sleep, or the network came back. Until then
+  the wallet could not reach it, and one that has been retrying for a while does so only
+  every 30 s. A connection still up when the relay returns may be dead and dropped by its
+  liveness check moments later: the connector knocks then, if that happens within 10 s.
+  The knocks go as on start (at once, after 2 s and after 6 s, while not
+  connected), and a sole holder's say "restarted": its own connection has ended, so one the
+  wallet still holds to it is dead. Measured on waking a computer: the wallet is back about
+  0.3 s after the extension's relay, instead of 7–22 s after the network.
 - A wallet that predates knocks registers no ALPN and refuses the handshake; a connector
   that predates them never knocks. Either way the link works as before.
 - A pairing session does not knock: the wallet does not know the link before it scans the

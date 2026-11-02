@@ -27,6 +27,10 @@ pub(super) const KNOCK_INITIAL_RTT: Duration = Duration::from_millis(100);
 /// it dialing.
 pub(super) const KNOCK_MIN_GAP: Duration = Duration::from_secs(2);
 
+/// Connector: how long after getting its relay back while still connected it watches for that
+/// connection to drop (a dead one goes within a liveness deadline, at most 3 s) to knock then.
+pub(super) const RELAY_RETURN_WATCH: Duration = Duration::from_secs(10);
+
 /// Wallet: a connection at least this old is from before a connector that knocks as just
 /// restarted ([`KNOCK_RESTARTED_ALPN`]): its knocks come within the first
 /// `KNOCKS_AT` + `KNOCK_TIMEOUT` (9 s) of its start, so a younger one may be to the new run.
@@ -41,7 +45,8 @@ pub(super) fn restarted_knock_min_age(config: &SessionConfig) -> Duration {
     RESTARTED_KNOCK_MIN_AGE
 }
 
-/// When a connector knocks after its session starts, while its wallet is not connected.
+/// When a connector knocks after its session starts, or its relay comes back, while its wallet
+/// is not connected.
 pub(super) const KNOCKS_AT: [Duration; 3] = [
     Duration::ZERO,
     Duration::from_secs(2),
@@ -154,6 +159,10 @@ pub(super) async fn knock_on_start(shared: &Shared) {
     let Some(relay) = shared.config.knock_relay().cloned() else {
         return;
     };
+    #[cfg(test)]
+    if shared.config.skip_start_knocks {
+        return;
+    }
     // On a custom relay, once this end reaches it: it is the relay the knock goes through, and
     // that takes milliseconds. On n0's public relays, at once: the knock goes to the WALLET's
     // relay over a connection of its own, while choosing this end's home relay takes seconds
@@ -165,12 +174,58 @@ pub(super) async fn knock_on_start(shared: &Shared) {
             () = shared.endpoint.online() => {}
         }
     }
-    for at in KNOCKS_AT {
-        // Closing never waits for a knock (nor for the next one).
+    knock_round(shared, &relay, shared.started_at).await;
+}
+
+/// Connector: knocks for its wallet again each time this end gets its relay back after losing
+/// it while the wallet is not connected — the computer woke from sleep, the network came
+/// back. Until then the wallet cannot reach this end, and one that has been retrying for a
+/// while does so only every 30 s; the knock brings it at once. As on start, the knock says
+/// "restarted" for a sole holder: this end's connection is gone, so a connection the wallet
+/// still holds to it is dead. Returns when the session closes.
+pub(super) async fn knock_when_relay_returns(shared: &Shared) {
+    let Some(relay) = shared.config.knock_relay().cloned() else {
+        return;
+    };
+    let mut regained = shared.relay_regained.subscribe();
+    loop {
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
-            () = time::sleep_until(shared.started_at + at) => {}
+            changed = regained.changed() => if changed.is_err() {
+                return;
+            },
+        }
+        regained.mark_unchanged();
+        // Still connected: the connection may have died during the outage, and its liveness
+        // check drop it within seconds (the host reports the wake-up as a network change).
+        let mut state = shared.state.subscribe();
+        let dropped = tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            dropped = time::timeout(
+                RELAY_RETURN_WATCH,
+                state.wait_for(|state| *state != ConnectionState::Connected),
+            ) => dropped.is_ok(),
+        };
+        if !dropped {
+            continue;
+        }
+        tracing::info!("the relay is back and the wallet is not connected: knocking for it");
+        knock_round(shared, &relay, Instant::now()).await;
+        // A relay that came back again during the round: this round was for it.
+        regained.mark_unchanged();
+    }
+}
+
+/// Knocks at [`KNOCKS_AT`] from `from` while the wallet is not connected; returns at once
+/// when the session closes (closing never waits for a knock, nor for the next one).
+async fn knock_round(shared: &Shared, relay: &RelayUrl, from: Instant) {
+    for at in KNOCKS_AT {
+        tokio::select! {
+            biased;
+            () = shared.wait_closed() => return,
+            () = time::sleep_until(from + at) => {}
         }
         if *shared.state.borrow() == ConnectionState::Connected {
             return;
@@ -178,7 +233,7 @@ pub(super) async fn knock_on_start(shared: &Shared) {
         tokio::select! {
             biased;
             () = shared.wait_closed() => return,
-            _ = knock(shared, &relay, shared.config.sole_holder) => {}
+            _ = knock(shared, relay, shared.config.sole_holder) => {}
         }
     }
 }

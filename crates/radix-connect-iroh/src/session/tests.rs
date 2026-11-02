@@ -2243,6 +2243,174 @@ async fn a_connector_that_starts_knocks_and_the_waiting_wallet_dials_at_once() {
     wallet.close().await;
 }
 
+/// A connector whose knocks on start are long over, and a wallet retrying every 30 s: what a
+/// computer that wakes from sleep finds.
+async fn after_a_long_outage(
+    link: &ConnectionPassword,
+    relay_url: &RelayUrl,
+) -> (Session, Session) {
+    let wallet = wallet_retrying_slowly(link, relay_url).await;
+    let mut config = sole_holder(relay_url);
+    config.skip_start_knocks = true;
+    let connector = Session::start(link, Role::Connector, config).await.unwrap();
+    assert!(
+        !connected_within(&connector, Duration::from_secs(3)).await,
+        "the wallet only tries again in up to 30 s"
+    );
+    (connector, wallet)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connector_whose_relay_comes_back_knocks_and_the_waiting_wallet_dials_at_once() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(80);
+    let (connector, wallet) = after_a_long_outage(&link, &relay_url).await;
+
+    // The relay is back (as `watch_relay` reports it after an outage).
+    let started = Instant::now();
+    connector
+        .shared
+        .relay_regained
+        .send_modify(|regained| *regained += 1);
+
+    assert!(
+        connected_within(&connector, Duration::from_secs(5)).await,
+        "knocked: the wallet dials now, not at its next retry"
+    );
+    logs.wait_for(
+        Level::INFO,
+        &["the relay is back and the wallet is not connected: knocking for it"],
+    )
+    .await;
+    deliver(&wallet, &connector, "after the relay came back")
+        .await
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    connector.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connector_whose_relay_comes_back_while_connected_knocks_for_nobody() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(81);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    let connections = connector.shared.connections.load(Ordering::Relaxed);
+
+    connector
+        .shared
+        .relay_regained
+        .send_modify(|regained| *regained += 1);
+    time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        logs.count(
+            Level::INFO,
+            &["the relay is back and the wallet is not connected"]
+        ),
+        0
+    );
+    assert_eq!(connector.state(), ConnectionState::Connected);
+    assert_eq!(
+        connector.shared.connections.load(Ordering::Relaxed),
+        connections
+    );
+    deliver(&wallet, &connector, "still the same connection")
+        .await
+        .unwrap();
+    connector.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connection_that_drops_soon_after_the_relay_came_back_is_followed_by_a_knock() {
+    let logs = capture();
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(83);
+    let mut config = sole_holder(&relay_url);
+    config.skip_start_knocks = true;
+    let connector = Session::start(&link, Role::Connector, config)
+        .await
+        .unwrap();
+    // A wallet that, once it loses the connector, tries again only every 30 s (its first
+    // attempt given the usual time).
+    let mut slowly = waiting_slowly(&relay_url);
+    slowly.retry.connect_timeout = Duration::from_secs(10);
+    let wallet = Session::start(&link, Role::Wallet, slowly).await.unwrap();
+    wait_for_state(&connector, ConnectionState::Connected).await;
+    let connections = connector.shared.connections.load(Ordering::Relaxed);
+
+    // The relay came back before the connection was known dead...
+    connector
+        .shared
+        .relay_regained
+        .send_modify(|regained| *regained += 1);
+    time::sleep(Duration::from_millis(500)).await;
+    // ...which it is moments later (as its liveness check finds after a wake-up).
+    connector
+        .shared
+        .connection
+        .borrow()
+        .clone()
+        .unwrap()
+        .connection
+        .close(CloseCode::Normal.into(), b"dead");
+
+    logs.wait_for(
+        Level::INFO,
+        &["the relay is back and the wallet is not connected: knocking for it"],
+    )
+    .await;
+    assert!(
+        time::timeout(Duration::from_secs(5), async {
+            while connector.shared.connections.load(Ordering::Relaxed) == connections
+                || connector.state() != ConnectionState::Connected
+            {
+                time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok(),
+        "connected again"
+    );
+    deliver(&wallet, &connector, "after the drop")
+        .await
+        .unwrap();
+    connector.close().await;
+    wallet.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn closing_a_connector_never_waits_for_its_knocks_after_a_relay_outage() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(82);
+    let mut config = config(&relay_url);
+    config.skip_start_knocks = true;
+    // No wallet: every knock waits for an answer that never comes.
+    let connector = Session::start(&link, Role::Connector, config)
+        .await
+        .unwrap();
+    connector
+        .shared
+        .relay_regained
+        .send_modify(|regained| *regained += 1);
+    time::sleep(Duration::from_millis(300)).await;
+
+    let started = Instant::now();
+    connector.close().await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn a_knock_from_anybody_but_the_links_connector_wakes_nothing() {
     let (relay_map, relay_url, _guard) = run_relay_server().await.unwrap();

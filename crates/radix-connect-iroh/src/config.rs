@@ -140,6 +140,9 @@ pub struct SessionConfig {
     /// Tests shorten how old a connection must be for a restarted knock to drop it.
     #[cfg(test)]
     pub(crate) restarted_knock_min_age: Option<std::time::Duration>,
+    /// Tests start a connector whose knocks on start are long over.
+    #[cfg(test)]
+    pub(crate) skip_start_knocks: bool,
 
     /// Tests run [`Relays::Public`] against a local relay and pkarr server.
     #[cfg(test)]
@@ -204,6 +207,8 @@ impl SessionConfig {
             relay_only: false,
             #[cfg(test)]
             restarted_knock_min_age: None,
+            #[cfg(test)]
+            skip_start_knocks: false,
 
             #[cfg(test)]
             test_public_infrastructure: None,

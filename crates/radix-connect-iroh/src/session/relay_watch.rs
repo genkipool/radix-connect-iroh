@@ -71,6 +71,12 @@ impl RelayLog {
             );
             self.since = now;
             self.warned = false;
+            // Back after an outage (it was home before): see `knock_when_relay_returns`.
+            if self.home.is_some() {
+                shared
+                    .relay_regained
+                    .send_modify(|regained| *regained = regained.wrapping_add(1));
+            }
             // The relay delivers to its newest client: this end, now.
             if std::mem::take(&mut shared.trouble().key_collision) {
                 tracing::info!(
