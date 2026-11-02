@@ -14,7 +14,8 @@ use super::accept::{
 use super::dial::{MAX_REPLACED_DELAY, Retry, delay_after_connection};
 use super::liveness::{
     PERIODIC_PROBE_DEADLINE, PERIODIC_PROBE_INTERVAL, PROBE_DEBOUNCE, PROBE_MAX_DEADLINE,
-    PROBE_MIN_DEADLINE, probe_deadline,
+    PROBE_MIN_DEADLINE, WATCH_INTERVAL, WATCH_MAX_DEADLINE, WATCH_MIN_DEADLINE, WATCH_WINDOW,
+    probe_deadline, watch_deadline,
 };
 
 /// Generous bound for anything that goes through the local relay.
@@ -312,16 +313,53 @@ async fn a_wallet_closed_from_the_background_is_known_gone_within_seconds() {
     heard(&connector, true).await;
 
     // The system ends the app: nothing is said, and only QUIC's idle timeout (30 s) would tell.
+    // The connector watches closely since the wallet went to the background: about a second.
     let ended = Instant::now();
     drop(wallet);
     time::timeout(
-        PERIODIC_PROBE_INTERVAL + PERIODIC_PROBE_DEADLINE + Duration::from_secs(3),
+        WATCH_INTERVAL + WATCH_MAX_DEADLINE + Duration::from_secs(1),
         wait_for_state(&connector, ConnectionState::Disconnected),
     )
     .await
     .expect("the connector still believed the wallet connected");
-    assert!(ended.elapsed() < Duration::from_secs(15));
+    assert!(ended.elapsed() < WATCH_INTERVAL + WATCH_MAX_DEADLINE + Duration::from_secs(1));
     connector.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_in_the_background_that_still_answers_stays_connected_while_watched_closely() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(38);
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+    wallet.set_in_background(true);
+    heard(&connector, true).await;
+
+    // The whole close watch, every check answered, and then a periodic one.
+    time::sleep(WATCH_WINDOW + PERIODIC_PROBE_INTERVAL + Duration::from_secs(1)).await;
+
+    assert_eq!(connector.state(), ConnectionState::Connected);
+    deliver(&connector, &wallet, "{\"watched\":\"and here\"}")
+        .await
+        .unwrap();
+    wallet.close().await;
+    connector.close().await;
+}
+
+#[test]
+fn a_close_watch_waits_three_round_trips_within_bounds() {
+    assert_eq!(watch_deadline(None), WATCH_MAX_DEADLINE);
+    assert_eq!(
+        watch_deadline(Some(Duration::from_millis(10))),
+        WATCH_MIN_DEADLINE
+    );
+    assert_eq!(
+        watch_deadline(Some(Duration::from_millis(300))),
+        Duration::from_millis(900)
+    );
+    assert_eq!(
+        watch_deadline(Some(Duration::from_secs(2))),
+        WATCH_MAX_DEADLINE
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

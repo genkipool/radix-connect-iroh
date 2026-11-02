@@ -204,6 +204,9 @@ struct Shared {
     in_background: AtomicBool,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
+    /// Bumped each time the wallet says its app went to the background: the connector then
+    /// watches the connection closely for a moment (see `liveness`).
+    went_to_background: watch::Sender<u64>,
     /// Wallet: the requests its host took and has not answered, for the inventory.
     held: std::sync::Mutex<Held>,
     /// Connector: the requests it delivered that the wallet has not answered.
@@ -328,6 +331,7 @@ impl Session {
             unauthorized,
             in_background: AtomicBool::new(false),
             peer_in_background: AtomicBool::new(false),
+            went_to_background: watch::Sender::new(0),
             held: std::sync::Mutex::default(),
             delivered: Arc::default(),
             peer_reports_requests: AtomicBool::new(false),
@@ -708,6 +712,9 @@ impl Shared {
             .peer_in_background
             .swap(in_background, Ordering::Relaxed);
         if before != in_background {
+            if in_background {
+                self.went_to_background.send_modify(|count| *count += 1);
+            }
             let _ = self.notices.try_send(Notice::Presence(in_background));
             tracing::info!(
                 in_background,

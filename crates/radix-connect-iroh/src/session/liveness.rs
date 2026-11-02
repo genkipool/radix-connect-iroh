@@ -31,8 +31,51 @@ pub(super) const PERIODIC_PROBE_INTERVAL: Duration = Duration::from_secs(4);
 /// nothing changed that calls for a quick verdict.
 pub(super) const PERIODIC_PROBE_DEADLINE: Duration = Duration::from_secs(3);
 
+/// Connector: how long it watches the connection closely once the wallet said its app went
+/// to the background. An app is closed from the system's recent apps screen, which sends it
+/// to the background first: its process then ends without a word, and is known gone within
+/// about [`WATCH_INTERVAL`] plus its deadline instead of [`PERIODIC_PROBE_INTERVAL`] plus
+/// [`PERIODIC_PROBE_DEADLINE`]. Short, so that a wallet merely in the background is not
+/// checked often for long (each check wakes its radio), and ending before the system
+/// freezes a cached app, which would answer late.
+pub(super) const WATCH_WINDOW: Duration = Duration::from_secs(8);
+
+/// How often the connector checks the wallet while watching it closely.
+pub(super) const WATCH_INTERVAL: Duration = Duration::from_millis(500);
+
+/// How long a check waits while watching closely: three round trips, within these bounds
+/// (the wallet just spoke, its path is known and fast).
+pub(super) const WATCH_MIN_DEADLINE: Duration = Duration::from_millis(600);
+pub(super) const WATCH_MAX_DEADLINE: Duration = Duration::from_millis(1500);
+
 /// Why a connection the peer stopped answering ended.
 pub(super) const NO_ANSWER: &str = "no answer to a liveness check";
+
+/// Why a liveness check runs: it sets its deadline and how loudly it is logged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Check {
+    /// The host reported a network change (or the app returning, the machine waking up).
+    NetworkChanged,
+    /// Connector: the regular check.
+    Periodic,
+    /// Connector: the close watch after the wallet went to the background.
+    Watching,
+}
+
+impl Check {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NetworkChanged => "network_changed",
+            Self::Periodic => "periodic",
+            Self::Watching => "watching",
+        }
+    }
+
+    /// The checks that come by themselves, every few seconds: logged at debug level only.
+    fn is_routine(self) -> bool {
+        self != Self::NetworkChanged
+    }
+}
 
 /// Checks that the peer still answers each time the host reports a network change
 /// (hosts report the app returning to the foreground, or the machine waking up, as
@@ -47,22 +90,49 @@ pub(super) async fn check_liveness(shared: &Shared, current: &Current) -> Ended 
     // reported since is, even if this task only starts now.
     let mut pending = *requests.borrow_and_update() != current.network;
     let periodic_checks = shared.role == Role::Connector;
+    let mut background = shared.went_to_background.subscribe();
+    background.mark_unchanged();
+    // Until when the connector watches closely (the wallet went to the background).
+    let mut watching_until: Option<Instant> = None;
     let mut last: Option<Instant> = None;
     loop {
-        let mut why = "network_changed";
+        let mut why = Check::NetworkChanged;
         if !std::mem::take(&mut pending) {
-            // A network change, or (connector) the next periodic check.
+            let watching = watching_until.is_some_and(|until| Instant::now() < until)
+                && shared
+                    .peer_in_background
+                    .load(std::sync::atomic::Ordering::Relaxed);
+            let interval = if watching {
+                WATCH_INTERVAL
+            } else {
+                PERIODIC_PROBE_INTERVAL
+            };
+            // A network change, or (connector) the next periodic check, or the wallet going
+            // to the background (which only sets the pace: it just spoke).
             tokio::select! {
                 changed = requests.changed() => {
                     if changed.is_err() {
                         std::future::pending::<()>().await;
                     }
                 }
-                () = time::sleep(PERIODIC_PROBE_INTERVAL), if periodic_checks => why = "periodic",
+                Ok(()) = background.changed(), if periodic_checks => {
+                    watching_until = Some(Instant::now() + WATCH_WINDOW);
+                    tracing::debug!(
+                        window_ms = ms(WATCH_WINDOW),
+                        interval_ms = ms(WATCH_INTERVAL),
+                        "the wallet went to the background: watching the connection closely"
+                    );
+                    continue;
+                }
+                () = time::sleep(interval), if periodic_checks => {
+                    why = if watching { Check::Watching } else { Check::Periodic };
+                }
             }
         }
         let now = Instant::now();
-        if let Some(ready) = last.map(|last| last + PROBE_DEBOUNCE)
+        // Only network changes share checks: periodic ones are paced already.
+        if why == Check::NetworkChanged
+            && let Some(ready) = last.map(|last| last + PROBE_DEBOUNCE)
             && ready > now
         {
             tracing::debug!(
@@ -77,16 +147,16 @@ pub(super) async fn check_liveness(shared: &Shared, current: &Current) -> Ended 
         last = Some(started);
         let (path, rtt) = diagnostics::selected_path(connection);
         let relay_connected = shared.relay_connected();
-        let deadline = if why == "periodic" {
-            PERIODIC_PROBE_DEADLINE
-        } else {
-            probe_deadline(rtt, path, relay_connected)
+        let deadline = match why {
+            Check::Periodic => PERIODIC_PROBE_DEADLINE,
+            Check::Watching => watch_deadline(rtt),
+            Check::NetworkChanged => probe_deadline(rtt, path, relay_connected),
         };
-        // Every few seconds: worth a debug line only.
-        let periodic = why == "periodic";
+        // Every few seconds (or more often while watching): worth a debug line only.
+        let periodic = why.is_routine();
         if periodic {
             tracing::debug!(
-                why,
+                why = why.as_str(),
                 path = path.map(PathKind::as_str),
                 rtt_ms = rtt.map(ms),
                 deadline_ms = ms(deadline),
@@ -94,7 +164,7 @@ pub(super) async fn check_liveness(shared: &Shared, current: &Current) -> Ended 
             );
         } else {
             tracing::info!(
-                why,
+                why = why.as_str(),
                 path = path.map(PathKind::as_str),
                 rtt_ms = rtt.map(ms),
                 relay_connected,
@@ -127,7 +197,7 @@ pub(super) async fn check_liveness(shared: &Shared, current: &Current) -> Ended 
             }
             Liveness::Unresponsive => {
                 tracing::warn!(
-                    why,
+                    why = why.as_str(),
                     deadline_ms = ms(deadline),
                     elapsed_ms = ms(started.elapsed()),
                     "the peer did not answer the liveness check: dropping the connection instead of waiting for it to time out"
@@ -155,4 +225,11 @@ pub(super) fn probe_deadline(
     }
     rtt.map_or(PROBE_MIN_DEADLINE, |rtt| rtt.saturating_mul(3))
         .clamp(PROBE_MIN_DEADLINE, PROBE_MAX_DEADLINE)
+}
+
+/// How long a check waits while the connector watches closely: three round trips within
+/// [`WATCH_MIN_DEADLINE`]..[`WATCH_MAX_DEADLINE`].
+pub(super) fn watch_deadline(rtt: Option<Duration>) -> Duration {
+    rtt.map_or(WATCH_MAX_DEADLINE, |rtt| rtt.saturating_mul(3))
+        .clamp(WATCH_MIN_DEADLINE, WATCH_MAX_DEADLINE)
 }
