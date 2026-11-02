@@ -85,8 +85,8 @@ pub struct SessionConfig {
     /// Tests run a relay with a self-signed certificate.
     #[cfg(test)]
     pub(crate) insecure_skip_relay_cert_verify: bool,
-    /// Tests use it to reproduce the browser, where only the relay is reachable.
-    #[cfg(test)]
+    /// Reproduces the browser, where only the relay is reachable (tests and benchmarks).
+    #[cfg(any(test, feature = "bench-utils"))]
     pub(crate) relay_only: bool,
     /// Tests shorten how old a connection must be for a restarted knock to drop it.
     #[cfg(test)]
@@ -153,7 +153,7 @@ impl SessionConfig {
             sole_holder: false,
             #[cfg(test)]
             insecure_skip_relay_cert_verify: false,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "bench-utils"))]
             relay_only: false,
             #[cfg(test)]
             restarted_knock_min_age: None,
@@ -205,6 +205,16 @@ impl SessionConfig {
         self.sole_holder = true;
         self
     }
+    /// An end with no UDP at all, reaching its peer only through the relay, as a browser
+    /// does. Only for measuring the transport as the Connector Extension sees it (the
+    /// `bench-utils` feature); never for a real link.
+    #[cfg(feature = "bench-utils")]
+    #[doc(hidden)]
+    pub fn relay_only_for_benchmarks(mut self) -> Self {
+        self.relay_only = true;
+        self
+    }
+
     /// The relays this session uses.
     pub fn relays(&self) -> &Relays {
         &self.relays

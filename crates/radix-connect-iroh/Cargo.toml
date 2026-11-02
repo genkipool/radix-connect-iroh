@@ -29,5 +29,14 @@ zeroize.workspace = true
 iroh = { workspace = true, features = ["test-utils"] }
 tokio = { version = "1.44", features = ["rt-multi-thread", "macros", "time", "io-std", "io-util"] }
 
+[features]
+# Settings for measuring the transport (`examples/session_bench.rs`): an end that reaches
+# its peer only through the relay, as a browser. Never needed by a wallet or an extension.
+bench-utils = []
+
+[[example]]
+name = "session_bench"
+required-features = ["bench-utils"]
+
 [lints]
 workspace = true

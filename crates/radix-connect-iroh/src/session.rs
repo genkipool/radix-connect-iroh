@@ -1125,7 +1125,7 @@ fn with_relays(
     config: &SessionConfig,
     role: Role,
 ) -> iroh::endpoint::Builder {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "bench-utils"))]
     let builder = test_builder(builder, config);
     match &config.relays {
         Relays::Custom(url) => builder.relay_mode(custom_relay_mode(url)),
@@ -1166,11 +1166,14 @@ fn custom_relay_mode(url: &RelayUrl) -> RelayMode {
     }
 }
 
-#[cfg(test)]
+/// Settings that only tests and benchmarks use. Skipping the relay's certificate check is
+/// compiled into tests alone, never into a build with `bench-utils`.
+#[cfg(any(test, feature = "bench-utils"))]
 fn test_builder(
     mut builder: iroh::endpoint::Builder,
     config: &SessionConfig,
 ) -> iroh::endpoint::Builder {
+    #[cfg(test)]
     if config.insecure_skip_relay_cert_verify {
         builder = builder.ca_tls_config(iroh::tls::CaTlsConfig::insecure_skip_verify());
     }
