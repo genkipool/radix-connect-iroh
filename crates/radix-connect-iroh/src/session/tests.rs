@@ -5,6 +5,17 @@ use iroh::RelayUrl;
 use iroh::test_utils::run_relay_server;
 
 use super::*;
+use iroh::endpoint::IncomingAddr;
+use iroh::{EndpointAddr, RelayMode};
+
+use super::accept::{
+    Admission, Ignored, MAX_DIRECT_HANDSHAKES, MAX_PEER_HANDSHAKES, PendingHandshakes, admission,
+};
+use super::dial::{MAX_REPLACED_DELAY, Retry, delay_after_connection};
+use super::liveness::{
+    PERIODIC_PROBE_DEADLINE, PERIODIC_PROBE_INTERVAL, PROBE_DEBOUNCE, PROBE_MAX_DEADLINE,
+    PROBE_MIN_DEADLINE, probe_deadline,
+};
 
 /// Generous bound for anything that goes through the local relay.
 const WAIT: Duration = Duration::from_secs(20);
@@ -12,8 +23,8 @@ const WAIT: Duration = Duration::from_secs(20);
 fn config(relay_url: &RelayUrl) -> SessionConfig {
     let mut config = SessionConfig::new(relay_url.as_str()).unwrap();
     config.insecure_skip_relay_cert_verify = true;
-    config.min_reconnect_delay = Duration::from_millis(50);
-    config.max_reconnect_delay = Duration::from_millis(500);
+    config.retry.min_delay = Duration::from_millis(50);
+    config.retry.max_delay = Duration::from_millis(500);
     config
 }
 
@@ -656,7 +667,7 @@ async fn diagnostics_explain_why_the_connection_ended() {
 async fn diagnostics_count_failed_attempts() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let mut wallet_config = config(&relay_url);
-    wallet_config.connect_timeout = Duration::from_millis(300);
+    wallet_config.retry.connect_timeout = Duration::from_millis(300);
     // Nobody listens for this link.
     let wallet = Session::start(&password(19), Role::Wallet, wallet_config)
         .await
@@ -688,8 +699,8 @@ async fn diagnostics_count_failed_attempts() {
 fn public(relay_url: &RelayUrl, lookup: &Arc<iroh::test_utils::DnsPkarrServer>) -> SessionConfig {
     let mut config = SessionConfig::public();
     config.insecure_skip_relay_cert_verify = true;
-    config.min_reconnect_delay = Duration::from_millis(50);
-    config.max_reconnect_delay = Duration::from_millis(500);
+    config.retry.min_delay = Duration::from_millis(50);
+    config.retry.max_delay = Duration::from_millis(500);
     config.test_public_infrastructure = Some(crate::config::TestPublicInfrastructure {
         relay_url: relay_url.clone(),
         lookup: lookup.clone(),
@@ -814,11 +825,8 @@ async fn a_large_message_is_not_cut_short_by_the_confirmation_timeout() {
 #[test]
 fn a_wallet_replaced_again_and_again_waits_longer_and_longer() {
     let mut config = config(&"https://relay.example.com".parse().unwrap());
-    config.max_reconnect_delay = Duration::from_secs(15);
-    assert_eq!(
-        delay_after_connection(0, &config),
-        config.min_reconnect_delay
-    );
+    config.retry.max_delay = Duration::from_secs(15);
+    assert_eq!(delay_after_connection(0, &config), config.retry.min_delay);
     assert_eq!(delay_after_connection(1, &config), Duration::from_secs(15));
     assert_eq!(delay_after_connection(2, &config), Duration::from_secs(30));
     assert_eq!(delay_after_connection(3, &config), Duration::from_secs(60));
@@ -838,8 +846,8 @@ async fn a_waiting_wallet_redials_only_on_network_changes_made_while_it_waits() 
         .unwrap();
     // Long waits between attempts: only a network change can make the wallet dial soon.
     let mut wallet_config = config(&relay_url);
-    wallet_config.min_reconnect_delay = Duration::from_secs(60);
-    wallet_config.max_reconnect_delay = Duration::from_secs(60);
+    wallet_config.retry.min_delay = Duration::from_secs(60);
+    wallet_config.retry.max_delay = Duration::from_secs(60);
     let wallet = Session::start(&link, Role::Wallet, wallet_config)
         .await
         .unwrap();
@@ -1615,10 +1623,10 @@ async fn the_logs_explain_why_the_wallet_cannot_connect() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(35);
     let mut wallet_config = config(&relay_url);
-    wallet_config.connect_timeout = Duration::from_millis(300);
+    wallet_config.retry.connect_timeout = Duration::from_millis(300);
     // Long waits between attempts: only a network change makes it dial again soon.
-    wallet_config.min_reconnect_delay = Duration::from_secs(30);
-    wallet_config.max_reconnect_delay = Duration::from_secs(30);
+    wallet_config.retry.min_delay = Duration::from_secs(30);
+    wallet_config.retry.max_delay = Duration::from_secs(30);
     // Nobody listens for this link.
     let wallet = Session::start(&link, Role::Wallet, wallet_config)
         .await
@@ -1934,7 +1942,11 @@ fn attempt_times(config: &SessionConfig, attempt: Duration, horizon: Duration) -
 fn the_wallet_retries_quickly_for_two_minutes_then_every_30_seconds() {
     let config = SessionConfig::public();
     // Attempts time out after 10 s (the connector is offline, its relay known).
-    let times = attempt_times(&config, config.connect_timeout, Duration::from_secs(300));
+    let times = attempt_times(
+        &config,
+        config.retry.connect_timeout,
+        Duration::from_secs(300),
+    );
     assert_eq!(
         times,
         [
@@ -1967,9 +1979,9 @@ async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(40);
     let mut wallet_config = config(&relay_url);
-    wallet_config.connect_timeout = Duration::from_millis(300);
-    wallet_config.fast_retry_period = Duration::from_millis(500);
-    wallet_config.slow_reconnect_delay = Duration::from_secs(120);
+    wallet_config.retry.connect_timeout = Duration::from_millis(300);
+    wallet_config.retry.fast_period = Duration::from_millis(500);
+    wallet_config.retry.slow_delay = Duration::from_secs(120);
     let wallet = Session::start(&link, Role::Wallet, wallet_config)
         .await
         .unwrap();
@@ -2025,9 +2037,9 @@ async fn a_wake_up_makes_a_slow_retrying_wallet_dial_at_once() {
 /// up after 1 s), as a phone left open with its connector offline.
 fn waiting_slowly(relay_url: &RelayUrl) -> SessionConfig {
     let mut config = config(relay_url);
-    config.fast_retry_period = Duration::ZERO;
-    config.slow_reconnect_delay = Duration::from_secs(30);
-    config.connect_timeout = Duration::from_secs(1);
+    config.retry.fast_period = Duration::ZERO;
+    config.retry.slow_delay = Duration::from_secs(30);
+    config.retry.connect_timeout = Duration::from_secs(1);
     config
 }
 

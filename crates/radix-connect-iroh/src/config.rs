@@ -61,6 +61,31 @@ const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// must keep reading events, or the peer's sends time out.
 const DEFAULT_HOST_SLOW_AFTER: Duration = Duration::from_secs(5);
 
+/// When the wallet dials the connector, and how long one attempt may take: quickly (a
+/// back-off from `min_delay`, doubling up to `max_delay`) for `fast_period` after the
+/// connection was lost, the session started or a wake-up, then every `slow_delay`. One
+/// place for every timing of the dial schedule, so a kind of session with other needs
+/// gets a policy of its own instead of special cases in the dialing code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryPolicy {
+    pub(crate) connect_timeout: Duration,
+    pub(crate) min_delay: Duration,
+    pub(crate) max_delay: Duration,
+    pub(crate) fast_period: Duration,
+    pub(crate) slow_delay: Duration,
+}
+
+impl RetryPolicy {
+    /// The schedule of a link's regular session.
+    pub(crate) const DEFAULT: Self = Self {
+        connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+        min_delay: DEFAULT_MIN_RECONNECT_DELAY,
+        max_delay: DEFAULT_MAX_RECONNECT_DELAY,
+        fast_period: DEFAULT_FAST_RETRY_PERIOD,
+        slow_delay: DEFAULT_SLOW_RECONNECT_DELAY,
+    };
+}
+
 /// Settings of a [`Session`](crate::Session). Both ends of a link must use the same
 /// [`Relays`].
 #[derive(Debug, Clone)]
@@ -69,11 +94,8 @@ pub struct SessionConfig {
     pub(crate) ack_timeout: Duration,
     pub(crate) max_message_size: usize,
     pub(crate) receive_timeout: Duration,
-    pub(crate) connect_timeout: Duration,
-    pub(crate) min_reconnect_delay: Duration,
-    pub(crate) max_reconnect_delay: Duration,
-    pub(crate) fast_retry_period: Duration,
-    pub(crate) slow_reconnect_delay: Duration,
+    /// When the wallet dials (again): see [`RetryPolicy`].
+    pub(crate) retry: RetryPolicy,
     pub(crate) host_slow_after: Duration,
     /// The relay the peer was last seen on (a connector's hint for its wallet): see
     /// [`SessionConfig::with_peer_relay`].
@@ -142,11 +164,7 @@ impl SessionConfig {
             ack_timeout: DEFAULT_ACK_TIMEOUT,
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             receive_timeout: DEFAULT_RECEIVE_TIMEOUT,
-            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
-            min_reconnect_delay: DEFAULT_MIN_RECONNECT_DELAY,
-            max_reconnect_delay: DEFAULT_MAX_RECONNECT_DELAY,
-            fast_retry_period: DEFAULT_FAST_RETRY_PERIOD,
-            slow_reconnect_delay: DEFAULT_SLOW_RECONNECT_DELAY,
+            retry: RetryPolicy::DEFAULT,
             host_slow_after: DEFAULT_HOST_SLOW_AFTER,
             peer_relay: None,
             knocks: true,
