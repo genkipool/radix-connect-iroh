@@ -216,6 +216,11 @@ pub struct IrohSessionConfig {
     /// Largest message sent or accepted, in bytes.
     #[uniffi(default = 8388608)]
     pub max_message_size: u64,
+    /// What the link's previous session remembered (`IrohSession.linkMemory()`), as stored
+    /// with the link; `None` for a new link. Opaque: store it, give it back. One that cannot be
+    /// read is ignored (the session starts as for a new link), never an error.
+    #[uniffi(default = None)]
+    pub link_memory: Option<String>,
 }
 
 impl TryFrom<IrohSessionConfig> for core::SessionConfig {
@@ -226,9 +231,20 @@ impl TryFrom<IrohSessionConfig> for core::SessionConfig {
             usize::try_from(config.max_message_size).map_err(|_| IrohError::Internal {
                 reason: "max_message_size does not fit this platform".to_owned(),
             })?;
-        Ok(core::SessionConfig::for_relay(config.relay_url.as_deref())?
+        let session_config = core::SessionConfig::for_relay(config.relay_url.as_deref())?
             .with_ack_timeout(Duration::from_millis(config.ack_timeout_ms))
-            .with_max_message_size(max_message_size))
+            .with_max_message_size(max_message_size);
+        Ok(match config.link_memory.as_deref() {
+            None => session_config,
+            Some(memory) => match session_config.clone().with_link_memory(memory) {
+                Ok(with_memory) => with_memory,
+                // A memory spoiled in storage must never keep the link from connecting.
+                Err(error) => {
+                    tracing::warn!(error = %error, "ignored a link memory that cannot be read");
+                    session_config
+                }
+            },
+        })
     }
 }
 
@@ -369,6 +385,16 @@ impl IrohSession {
         self.session.diagnostics().into()
     }
 
+    /// What this session remembers of its link (an opaque string with no secret): store it
+    /// with the link and give it back in `IrohSessionConfig.linkMemory` when starting the
+    /// link's next session. Read it once connected and when stopping the session.
+    pub async fn link_memory(&self) -> String {
+        let session = self.session.clone();
+        on_runtime(async move { session.link_memory().await })
+            .await
+            .unwrap_or_default()
+    }
+
     /// Sends one message and waits until the peer confirms it. Fails at once with
     /// `NotConnected` when there is no connection.
     pub async fn send(&self, message: String) -> Result<(), IrohError> {
@@ -499,17 +525,32 @@ mod tests {
             relay_url: Some("https://relay.example.com".to_owned()),
             ack_timeout_ms: 1500,
             max_message_size: 1024,
+            link_memory: None,
         };
         assert!(core::SessionConfig::try_from(config).is_ok());
         let invalid = IrohSessionConfig {
             relay_url: Some("nope".to_owned()),
             ack_timeout_ms: 1500,
             max_message_size: 1024,
+            link_memory: None,
         };
         assert!(matches!(
             core::SessionConfig::try_from(invalid),
             Err(IrohError::InvalidRelayUrl { .. })
         ));
+    }
+
+    #[test]
+    fn a_link_memory_that_cannot_be_read_never_blocks_the_link() {
+        for memory in ["not json", r#"{"v":1,"peerRelay":5}"#, ""] {
+            let config = IrohSessionConfig {
+                relay_url: None,
+                ack_timeout_ms: 1500,
+                max_message_size: 1024,
+                link_memory: Some(memory.to_owned()),
+            };
+            assert!(core::SessionConfig::try_from(config).is_ok(), "{memory}");
+        }
     }
 
     #[test]
@@ -522,6 +563,7 @@ mod tests {
                 relay_url: Some("https://relay.invalid".to_owned()),
                 ack_timeout_ms: 1000,
                 max_message_size: 1024,
+                link_memory: None,
             },
         ))
         .unwrap();

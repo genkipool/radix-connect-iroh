@@ -5,6 +5,8 @@ use iroh::RelayUrl;
 use iroh::test_utils::run_relay_server;
 
 use super::*;
+use crate::config::RetryPolicy;
+use crate::link_memory::LinkMemory;
 use iroh::endpoint::IncomingAddr;
 use iroh::{EndpointAddr, RelayMode};
 
@@ -1964,16 +1966,97 @@ async fn a_dead_connection_is_dropped_within_seconds_of_a_network_change() {
 /// after `attempt`: the start times of its attempts, in seconds, within `horizon`.
 fn attempt_times(config: &SessionConfig, attempt: Duration, horizon: Duration) -> Vec<f64> {
     let start = time::Instant::now();
-    let mut retry = Retry::new(start, config);
+    let mut retry = Retry::new(start, config.retry);
     let mut at = Duration::ZERO;
     let mut times = Vec::new();
     while at < horizon {
         times.push(at.as_secs_f64());
         at += attempt;
-        let (delay, _) = retry.after_failure(start + at, config);
+        let (delay, _) = retry.after_failure(start + at);
         at += delay;
     }
     times
+}
+
+/// `attempt_times` for a [`Retry`] that follows `policy`.
+fn attempt_times_with(policy: RetryPolicy, attempt: Duration, horizon: Duration) -> Vec<f64> {
+    let mut config = SessionConfig::public();
+    config.retry = policy;
+    attempt_times(&config, attempt, horizon)
+}
+
+#[test]
+fn a_dormant_link_is_dialed_once_then_every_two_minutes() {
+    let regular = SessionConfig::public().retry;
+    let times = attempt_times_with(
+        regular.dormant(),
+        regular.connect_timeout,
+        Duration::from_secs(600),
+    );
+    // No quick retries: the first attempt, then one every 120 s after each 10 s attempt.
+    assert_eq!(times, [0.0, 130.0, 260.0, 390.0, 520.0]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_wallet_dials_a_connector_unseen_for_a_day_as_dormant() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let now = crate::link_memory::unix_now().unwrap();
+    let memory = |seconds_ago: u64| format!(r#"{{"v":1,"lastConnected":{}}}"#, now - seconds_ago);
+    let start = |memory: Option<String>| {
+        let relay_url = relay_url.clone();
+        async move {
+            let mut config = config(&relay_url);
+            if let Some(memory) = memory {
+                config = config.with_link_memory(&memory).unwrap();
+            }
+            Session::start(&password(39), Role::Wallet, config)
+                .await
+                .unwrap()
+        }
+    };
+
+    let unseen = start(Some(memory(2 * 24 * 60 * 60))).await;
+    assert_eq!(
+        unseen.shared.retry_policy(),
+        unseen.shared.config.retry.dormant()
+    );
+    unseen.close().await;
+
+    let seen_lately = start(Some(memory(60 * 60))).await;
+    assert_eq!(
+        seen_lately.shared.retry_policy(),
+        seen_lately.shared.config.retry
+    );
+    seen_lately.close().await;
+
+    // A new link (no memory): the regular schedule, it is expected to connect.
+    let new_link = start(None).await;
+    assert_eq!(new_link.shared.retry_policy(), new_link.shared.config.retry);
+    new_link.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_link_memory_keeps_when_and_where_the_peer_was_last_seen() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let link = password(40);
+    let before = crate::link_memory::unix_now().unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &link).await;
+
+    for session in [&connector, &wallet] {
+        let memory = LinkMemory::parse(&session.link_memory().await).unwrap();
+        assert!(
+            memory.last_connected.is_some_and(|at| at >= before),
+            "{memory:?}"
+        );
+        assert_eq!(memory.peer_relay.as_ref(), Some(&relay_url));
+        // What the host stores is what the next session is started with.
+        let next = config(&relay_url)
+            .with_link_memory(&memory.to_text())
+            .unwrap();
+        assert_eq!(next.last_connected, memory.last_connected);
+    }
+    wallet.close().await;
+    connector.close().await;
 }
 
 #[test]

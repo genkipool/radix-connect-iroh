@@ -219,6 +219,10 @@ impl IrohSession {
     /// it starts, a wallet still connected to an earlier run that ended without closing (a
     /// reload) drops that connection and dials at once. Never for a link several processes
     /// may hold at once.
+    ///
+    /// `linkMemory`: what the link's previous session remembered (`linkMemory()`), as stored
+    /// with the link. One that cannot be read is ignored (the session starts as for a new
+    /// link), never an error.
     pub async fn start(
         password: Vec<u8>,
         #[wasm_bindgen(unchecked_param_type = "IrohRole")] role: String,
@@ -226,6 +230,7 @@ impl IrohSession {
         #[wasm_bindgen(js_name = ackTimeoutMs)] ack_timeout_ms: Option<u32>,
         #[wasm_bindgen(js_name = peerRelayUrl)] peer_relay_url: Option<String>,
         #[wasm_bindgen(js_name = soleHolder)] sole_holder: Option<bool>,
+        #[wasm_bindgen(js_name = linkMemory)] link_memory: Option<String>,
     ) -> Result<IrohSession, JsValue> {
         let password = password_from(password)?;
         let role = role_from(&role)?;
@@ -242,6 +247,10 @@ impl IrohSession {
         }
         if sole_holder == Some(true) {
             config = config.as_sole_holder();
+        }
+        if let Some(memory) = link_memory.as_deref() {
+            // A memory spoiled in storage must never keep the link from connecting.
+            config = config.clone().with_link_memory(memory).unwrap_or(config);
         }
         install_subscriber();
         let session = core::Session::start(&password, role, config)
@@ -318,10 +327,6 @@ impl IrohSession {
         })
     }
 
-    /// Reports that the network changed, or that the machine woke up or the extension
-    /// became active again: a waiting wallet dials at once, and the current connection
-    /// is checked, dropped within seconds if the peer no longer answers (instead of
-    /// looking connected until it times out).
     /// The relay the peer is on, as this end knows it (best while connected), or undefined:
     /// for a connector, what to keep with the link and pass back as `peerRelayUrl`.
     #[wasm_bindgen(js_name = peerRelay, unchecked_return_type = "Promise<string | undefined>")]
@@ -335,6 +340,19 @@ impl IrohSession {
         })
     }
 
+    /// What this session remembers of its link (an opaque string with no secret): keep it
+    /// with the link and pass it back as `linkMemory` when starting the link's next session.
+    /// Read it once connected and when shutting the session down.
+    #[wasm_bindgen(js_name = linkMemory, unchecked_return_type = "Promise<string>")]
+    pub fn link_memory(&self) -> Promise {
+        let session = self.session.clone();
+        future_to_promise(async move { Ok(JsValue::from_str(&session.link_memory().await)) })
+    }
+
+    /// Reports that the network changed, or that the machine woke up or the extension
+    /// became active again: a waiting wallet dials at once, and the current connection
+    /// is checked, dropped within seconds if the peer no longer answers (instead of
+    /// looking connected until it times out).
     #[wasm_bindgen(js_name = networkChanged, unchecked_return_type = "Promise<void>")]
     pub fn network_changed(&self) -> Promise {
         let session = self.session.clone();

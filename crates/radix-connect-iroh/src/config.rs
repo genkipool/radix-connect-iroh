@@ -84,7 +84,30 @@ impl RetryPolicy {
         fast_period: DEFAULT_FAST_RETRY_PERIOD,
         slow_delay: DEFAULT_SLOW_RECONNECT_DELAY,
     };
+
+    /// The schedule a wallet follows instead for a link whose connector has not been
+    /// connected for [`DORMANT_AFTER`] (an old browser, a removed extension): one attempt
+    /// when the session starts and at each wake-up (the app returning, a network change, the
+    /// connector's knock), and one every [`DORMANT_RECONNECT_DELAY`] (at least) otherwise,
+    /// instead of quick retries for `fast_period` and one every `slow_delay`. A connector that
+    /// comes back knocks, which dials at once: like the WebRTC transport's wallet, which waits
+    /// on the signaling server for its connector, the wallet waits for its connector instead
+    /// of searching for it.
+    pub(crate) fn dormant(self) -> Self {
+        Self {
+            fast_period: Duration::ZERO,
+            slow_delay: self.slow_delay.max(DORMANT_RECONNECT_DELAY),
+            ..self
+        }
+    }
 }
+
+/// How long a link's connector must have been out of reach for its wallet to dial it only now
+/// and then ([`RetryPolicy::dormant`]).
+pub(crate) const DORMANT_AFTER: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Delay between a dormant link's attempts when nothing wakes the wallet.
+pub(crate) const DORMANT_RECONNECT_DELAY: Duration = Duration::from_secs(120);
 
 /// Settings of a [`Session`](crate::Session). Both ends of a link must use the same
 /// [`Relays`].
@@ -100,6 +123,8 @@ pub struct SessionConfig {
     /// The relay the peer was last seen on (a connector's hint for its wallet): see
     /// [`SessionConfig::with_peer_relay`].
     pub(crate) peer_relay: Option<RelayUrl>,
+    /// When the peer was last connected (Unix seconds), from the link memory given back.
+    pub(crate) last_connected: Option<u64>,
     /// Whether a connector knocks when its session starts (see [`SessionConfig::without_knocks`]).
     pub(crate) knocks: bool,
     /// The connector is the only holder of its link: see [`SessionConfig::as_sole_holder`].
@@ -167,6 +192,7 @@ impl SessionConfig {
             retry: RetryPolicy::DEFAULT,
             host_slow_after: DEFAULT_HOST_SLOW_AFTER,
             peer_relay: None,
+            last_connected: None,
             knocks: true,
             sole_holder: false,
             #[cfg(test)]
@@ -202,6 +228,24 @@ impl SessionConfig {
     /// or old relay only means the knock does not arrive; nothing else changes.
     pub fn with_peer_relay(mut self, relay_url: &str) -> Result<Self, Error> {
         self.peer_relay = Some(parse_relay_url(relay_url)?);
+        Ok(self)
+    }
+
+    /// What the link's previous session remembered ([`Session::link_memory`](crate::Session::link_memory)),
+    /// as the host stored it: the relay the peer was last seen on (a connector knocks there)
+    /// and when it was last connected (a wallet dials a connector out of reach for a long time
+    /// only now and then, and waits for its knock). An empty string is no memory, as for a new
+    /// link; one of a format this library does not know is ignored.
+    ///
+    /// # Errors
+    /// [`Error::InvalidLinkMemory`] or [`Error::InvalidRelayUrl`] for a string this library did
+    /// not write.
+    pub fn with_link_memory(mut self, memory: &str) -> Result<Self, Error> {
+        let memory = crate::link_memory::LinkMemory::parse(memory)?;
+        if let Some(url) = memory.peer_relay {
+            self.peer_relay = Some(url);
+        }
+        self.last_connected = memory.last_connected;
         Ok(self)
     }
 
@@ -250,7 +294,7 @@ impl SessionConfig {
     }
 }
 
-fn parse_relay_url(input: &str) -> Result<RelayUrl, Error> {
+pub(crate) fn parse_relay_url(input: &str) -> Result<RelayUrl, Error> {
     let invalid = |reason: &str| Error::InvalidRelayUrl(reason.to_owned());
     let url: RelayUrl = input
         .trim()

@@ -6,6 +6,7 @@ use super::receive::serve;
 use super::{ConnectionState, Ended, Shared};
 use crate::SessionConfig;
 use crate::config::Relays;
+use crate::config::RetryPolicy;
 use crate::diagnostics::{DialFailure, ms};
 use crate::logging::Redacted;
 use crate::protocol::{ALPN, CloseCode};
@@ -68,7 +69,7 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
     let config = &shared.config;
     let mut network = shared.network.subscribe();
     let mut knocks = shared.knocks.subscribe();
-    let mut retry = Retry::new(shared.started_at, config);
+    let mut retry = Retry::new(shared.started_at, shared.retry_policy());
     let mut delay = config.retry.min_delay;
     let mut replaced_in_a_row = 0;
     let mut reason = DialReason::First;
@@ -127,7 +128,7 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
                 // iroh carried the connection across the network changes made meanwhile.
                 network.mark_unchanged();
                 unreachable_since = Instant::now();
-                retry = Retry::new(unreachable_since, config);
+                retry = Retry::new(unreachable_since, shared.retry_policy());
                 if was_replaced(&connection) {
                     replaced_in_a_row += 1;
                     reason = DialReason::Replaced;
@@ -207,11 +208,11 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
             }
             reason = DialReason::Retry;
             let slowing_down;
-            (delay, slowing_down) = retry.after_failure(Instant::now(), config);
+            (delay, slowing_down) = retry.after_failure(Instant::now());
             if slowing_down {
                 tracing::info!(
                     unreachable_ms = ms(unreachable_since.elapsed()),
-                    fast_retry_period_ms = ms(config.retry.fast_period),
+                    fast_retry_period_ms = ms(retry.policy.fast_period),
                     delay_ms = ms(delay),
                     "the connector is still unreachable: retrying less often (every delay_ms) until the app returns to the foreground or the network changes"
                 );
@@ -249,7 +250,7 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
                     reason = DialReason::NetworkChanged;
                 }
                 // A wake-up: the connector may be back, retry quickly again.
-                retry = Retry::new(Instant::now(), config);
+                retry = Retry::new(Instant::now(), shared.retry_policy());
             }
             () = time::sleep(delay) => {}
         }
@@ -265,35 +266,32 @@ pub(super) async fn dial(shared: &Arc<Shared>) {
 /// offline do not keep the phone's radio awake. A connection resets it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Retry {
+    pub(super) policy: RetryPolicy,
     fast_since: Instant,
     next_fast: Duration,
     slow: bool,
 }
 
 impl Retry {
-    pub(super) fn new(fast_since: Instant, config: &SessionConfig) -> Self {
+    pub(super) fn new(fast_since: Instant, policy: RetryPolicy) -> Self {
         Self {
+            policy,
             fast_since,
-            next_fast: config.retry.min_delay,
+            next_fast: policy.min_delay,
             slow: false,
         }
     }
 
     /// The wait after an attempt that failed at `now`, and whether it is the first of
     /// the slow ones.
-    pub(super) fn after_failure(
-        &mut self,
-        now: Instant,
-        config: &SessionConfig,
-    ) -> (Duration, bool) {
-        if now.saturating_duration_since(self.fast_since) >= config.retry.fast_period {
+    pub(super) fn after_failure(&mut self, now: Instant) -> (Duration, bool) {
+        let policy = self.policy;
+        if now.saturating_duration_since(self.fast_since) >= policy.fast_period {
             let first = !std::mem::replace(&mut self.slow, true);
-            (config.retry.slow_delay, first)
+            (policy.slow_delay, first)
         } else {
             let delay = self.next_fast;
-            self.next_fast = (delay * 2)
-                .max(config.retry.min_delay)
-                .min(config.retry.max_delay);
+            self.next_fast = (delay * 2).max(policy.min_delay).min(policy.max_delay);
             (delay, false)
         }
     }

@@ -11,6 +11,10 @@ pub enum Error {
     /// The local iroh endpoint could not be created.
     #[error("could not start the iroh endpoint: {0}")]
     Bind(String),
+    /// The link memory given back is not one this library wrote (see
+    /// [`SessionConfig::with_link_memory`](crate::SessionConfig::with_link_memory)).
+    #[error("invalid link memory: {0}")]
+    InvalidLinkMemory(String),
 }
 
 /// Why a message could not be delivered by [`Session::send`](crate::Session::send).

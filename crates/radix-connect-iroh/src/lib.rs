@@ -48,6 +48,7 @@ pub mod diagnostics;
 mod error;
 mod guard;
 pub mod keys;
+mod link_memory;
 pub mod logging;
 mod protocol;
 mod relay_health;
