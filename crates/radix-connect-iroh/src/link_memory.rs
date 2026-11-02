@@ -7,9 +7,10 @@
 //! today:
 //!
 //! - the relay the peer was last seen on: a connector knocks there when it starts;
-//! - when the peer was last connected: a wallet dials a link whose connector has not been
-//!   seen for a long time only now and then (see `RetryPolicy::DORMANT`), instead of again
-//!   and again, and waits for the connector's knock.
+//! - when the peer was last connected, and since when the link is known: a wallet dials a link
+//!   whose connector has not been connected for a long time (or never, since it is known) only
+//!   now and then (see `RetryPolicy::dormant`), instead of again and again, and waits for the
+//!   connector's knock.
 //!
 //! Only a relay URL and a time: no secret, no IP address.
 
@@ -32,6 +33,9 @@ pub(crate) struct LinkMemory {
     pub(crate) peer_relay: Option<RelayUrl>,
     /// When the peer was last connected, in seconds since the Unix epoch.
     pub(crate) last_connected: Option<u64>,
+    /// Since when this memory knows the link (its first session that kept one), in seconds
+    /// since the Unix epoch: a link never connected since then is dormant all the same.
+    pub(crate) known_since: Option<u64>,
 }
 
 impl LinkMemory {
@@ -56,17 +60,19 @@ impl LinkMemory {
             Some(Value::String(url)) => Some(parse_relay_url(url)?),
             Some(_) => return Err(invalid("peerRelay is not a string")),
         };
-        let last_connected = match object.get("lastConnected") {
-            None | Some(Value::Null) => None,
-            Some(value) => Some(
-                value
+        let seconds = |key: &str| -> Result<Option<u64>, Error> {
+            match object.get(key) {
+                None | Some(Value::Null) => Ok(None),
+                Some(value) => value
                     .as_u64()
-                    .ok_or_else(|| invalid("lastConnected is not a number of seconds"))?,
-            ),
+                    .map(Some)
+                    .ok_or_else(|| invalid(&format!("{key} is not a number of seconds"))),
+            }
         };
         Ok(Self {
             peer_relay,
-            last_connected,
+            last_connected: seconds("lastConnected")?,
+            known_since: seconds("knownSince")?,
         })
     }
 
@@ -80,13 +86,18 @@ impl LinkMemory {
         if let Some(at) = self.last_connected {
             object.insert("lastConnected".to_owned(), json!(at));
         }
+        if let Some(at) = self.known_since {
+            object.insert("knownSince".to_owned(), json!(at));
+        }
         Value::Object(object).to_string()
     }
 
-    /// How long ago the peer was last connected, or `None` if it never was (as far as
-    /// this memory knows) or the clock is not usable.
-    pub(crate) fn since_last_connected(&self, now: u64) -> Option<u64> {
-        self.last_connected.map(|at| now.saturating_sub(at))
+    /// How long ago the peer was last connected, or, if it never was, how long the link has
+    /// been known; `None` when this memory knows neither.
+    pub(crate) fn since_last_seen(&self, now: u64) -> Option<u64> {
+        self.last_connected
+            .or(self.known_since)
+            .map(|at| now.saturating_sub(at))
     }
 }
 
@@ -107,6 +118,7 @@ mod tests {
         let memory = LinkMemory {
             peer_relay: Some(parse_relay_url("https://euc1-1.relay.n0.iroh.link./").unwrap()),
             last_connected: Some(1_793_600_000),
+            known_since: Some(1_793_000_000),
         };
         assert_eq!(LinkMemory::parse(&memory.to_text()).unwrap(), memory);
         assert_eq!(
@@ -139,6 +151,7 @@ mod tests {
             r#"{"v":1,"peerRelay":"http://8.8.8.8:3340"}"#,
             r#"{"v":1,"lastConnected":"yesterday"}"#,
             r#"{"v":1,"lastConnected":-1}"#,
+            r#"{"v":1,"knownSince":"long ago"}"#,
         ] {
             assert!(
                 matches!(
@@ -151,14 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn the_time_since_the_last_connection_never_underflows() {
-        let memory = LinkMemory {
+    fn a_link_is_last_seen_at_its_last_connection_or_since_it_is_known() {
+        let connected = LinkMemory {
             peer_relay: None,
             last_connected: Some(100),
+            known_since: Some(10),
         };
-        assert_eq!(memory.since_last_connected(160), Some(60));
+        assert_eq!(connected.since_last_seen(160), Some(60));
         // A clock set back: zero, not a wrap-around.
-        assert_eq!(memory.since_last_connected(40), Some(0));
-        assert_eq!(LinkMemory::default().since_last_connected(160), None);
+        assert_eq!(connected.since_last_seen(40), Some(0));
+        let never_connected = LinkMemory {
+            known_since: Some(10),
+            ..LinkMemory::default()
+        };
+        assert_eq!(never_connected.since_last_seen(160), Some(150));
+        assert_eq!(LinkMemory::default().since_last_seen(160), None);
     }
 }

@@ -2033,6 +2033,18 @@ async fn a_wallet_dials_a_connector_unseen_for_a_day_as_dormant() {
     let new_link = start(None).await;
     assert_eq!(new_link.shared.retry_policy(), new_link.shared.config.retry);
     new_link.close().await;
+
+    // Known for two days and never connected: dormant too.
+    let never = start(Some(format!(
+        r#"{{"v":1,"knownSince":{}}}"#,
+        now - 2 * 24 * 60 * 60
+    )))
+    .await;
+    assert_eq!(
+        never.shared.retry_policy(),
+        never.shared.config.retry.dormant()
+    );
+    never.close().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -2046,6 +2058,10 @@ async fn the_link_memory_keeps_when_and_where_the_peer_was_last_seen() {
         let memory = LinkMemory::parse(&session.link_memory().await).unwrap();
         assert!(
             memory.last_connected.is_some_and(|at| at >= before),
+            "{memory:?}"
+        );
+        assert!(
+            memory.known_since.is_some_and(|at| at >= before),
             "{memory:?}"
         );
         assert_eq!(memory.peer_relay.as_ref(), Some(&relay_url));

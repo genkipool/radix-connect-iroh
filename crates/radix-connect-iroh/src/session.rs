@@ -206,9 +206,12 @@ struct Shared {
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
     /// When the peer was last connected (Unix seconds; 0: not known), from the link memory
-    /// given back, then each connection: kept in the memory, and what makes a wallet treat a
-    /// link as dormant (see `RetryPolicy::DORMANT`).
+    /// given back, then each connection: kept in the memory, and with `known_since` what
+    /// makes a wallet treat a link as dormant (see `RetryPolicy::dormant`).
     last_connected: AtomicU64,
+    /// Since when the link is known (Unix seconds): from the memory given back, or this
+    /// session's start for a link with none.
+    known_since: Option<u64>,
     /// Bumped each time the wallet says its app went to the background: the connector then
     /// watches the connection closely for a moment (see `liveness`).
     went_to_background: watch::Sender<u64>,
@@ -313,6 +316,7 @@ impl Session {
         let (messages_tx, messages_rx) = mpsc::channel(MESSAGE_BUFFER);
         let (notices_tx, notices_rx) = mpsc::channel(NOTICE_BUFFER);
         let last_connected = AtomicU64::new(config.last_connected.unwrap_or(0));
+        let known_since = config.known_since.or_else(link_memory::unix_now);
         let shared = Arc::new(Shared {
             endpoint,
             role,
@@ -338,6 +342,7 @@ impl Session {
             in_background: AtomicBool::new(false),
             peer_in_background: AtomicBool::new(false),
             last_connected,
+            known_since,
             went_to_background: watch::Sender::new(0),
             held: std::sync::Mutex::default(),
             delivered: Arc::default(),
@@ -413,7 +418,8 @@ impl Session {
 
     /// What this session remembers of its link, for the host to store with it and give back
     /// to the link's next session ([`SessionConfig::with_link_memory`]): an opaque string with
-    /// no secret (the relay the peer was last seen on and when it was last connected). Read it
+    /// no secret (the relay the peer was last seen on, when it was last connected and since when
+    /// the link is known). Read it
     /// after a connection ([`ConnectionState::Connected`]) and when stopping the session.
     pub async fn link_memory(&self) -> String {
         LinkMemory {
@@ -422,6 +428,7 @@ impl Session {
                 .await
                 .or_else(|| self.shared.config.peer_relay.clone()),
             last_connected: self.shared.last_connected(),
+            known_since: self.shared.known_since,
         }
         .to_text()
     }
@@ -939,15 +946,16 @@ impl Shared {
     }
 
     /// The wallet's dialing schedule: [dormant](RetryPolicy::dormant) for a link whose connector
-    /// has not been connected for [`DORMANT_AFTER`] (and not since this session started), the
-    /// regular one otherwise, a new link's included.
+    /// has not been connected for [`DORMANT_AFTER`] (or never, in that long since the link is
+    /// known), the regular one otherwise, a new link's included.
     fn retry_policy(&self) -> RetryPolicy {
         let memory = LinkMemory {
             peer_relay: None,
             last_connected: self.last_connected(),
+            known_since: self.known_since,
         };
         let dormant = link_memory::unix_now()
-            .and_then(|now| memory.since_last_connected(now))
+            .and_then(|now| memory.since_last_seen(now))
             .is_some_and(|since| since >= DORMANT_AFTER.as_secs());
         if dormant {
             self.config.retry.dormant()

@@ -123,8 +123,10 @@ pub struct SessionConfig {
     /// The relay the peer was last seen on (a connector's hint for its wallet): see
     /// [`SessionConfig::with_peer_relay`].
     pub(crate) peer_relay: Option<RelayUrl>,
-    /// When the peer was last connected (Unix seconds), from the link memory given back.
+    /// When the peer was last connected, and since when the link is known (Unix seconds),
+    /// from the link memory given back.
     pub(crate) last_connected: Option<u64>,
+    pub(crate) known_since: Option<u64>,
     /// Whether a connector knocks when its session starts (see [`SessionConfig::without_knocks`]).
     pub(crate) knocks: bool,
     /// The connector is the only holder of its link: see [`SessionConfig::as_sole_holder`].
@@ -193,6 +195,7 @@ impl SessionConfig {
             host_slow_after: DEFAULT_HOST_SLOW_AFTER,
             peer_relay: None,
             last_connected: None,
+            known_since: None,
             knocks: true,
             sole_holder: false,
             #[cfg(test)]
@@ -246,6 +249,7 @@ impl SessionConfig {
             self.peer_relay = Some(url);
         }
         self.last_connected = memory.last_connected;
+        self.known_since = memory.known_since;
         Ok(self)
     }
 
