@@ -449,23 +449,32 @@ pub(crate) enum Acknowledged {
     Failed,
 }
 
-impl Answer {
-    /// Confirms to the peer that the application took its message, and waits (at most
-    /// `flush_timeout`) for the peer to acknowledge the confirmation, so that closing
-    /// right after does not discard it.
-    pub(crate) async fn acknowledge(self, flush_timeout: Duration) -> Acknowledged {
-        let Self(mut stream) = self;
-        if stream.write_all(&[STATUS_RECEIVED]).await.is_err() {
-            return Acknowledged::Failed;
-        }
-        let Ok(stream) = stream.finish() else {
-            return Acknowledged::Failed;
-        };
-        match time::timeout(flush_timeout, stream.stopped()).await {
+/// A confirmation written and finished, on its way to the peer.
+#[derive(Debug)]
+pub(crate) struct Confirmation(SendStream);
+
+impl Confirmation {
+    /// Waits (at most `flush_timeout`) for the peer to acknowledge the confirmation, so
+    /// that closing right after does not discard it.
+    pub(crate) async fn acknowledged(self, flush_timeout: Duration) -> Acknowledged {
+        match time::timeout(flush_timeout, self.0.stopped()).await {
             Ok(Ok(None)) => Acknowledged::Flushed,
             Ok(_) => Acknowledged::Failed,
             Err(_) => Acknowledged::Unflushed,
         }
+    }
+}
+
+impl Answer {
+    /// Confirms to the peer that the application took its message: writes the status and
+    /// finishes the stream. Whether the peer acknowledged it is
+    /// [`Confirmation::acknowledged`], which a receiver need not wait for before reading the
+    /// next message. `None` when it could not be written (the peer stopped waiting or the
+    /// connection ended).
+    pub(crate) async fn confirm(self) -> Option<Confirmation> {
+        let Self(mut stream) = self;
+        stream.write_all(&[STATUS_RECEIVED]).await.ok()?;
+        stream.finish().ok().map(Confirmation)
     }
 
     /// Resolves when the peer stops waiting for the answer (it gave up, or the
@@ -638,7 +647,11 @@ mod tests {
             async {
                 match read_one(&server_conn).await {
                     Ok(Incoming::Message(message, answer)) => {
-                        answer.acknowledge(Duration::from_secs(1)).await;
+                        let confirmation = answer.confirm().await.expect("confirmation written");
+                        assert_eq!(
+                            confirmation.acknowledged(Duration::from_secs(1)).await,
+                            Acknowledged::Flushed
+                        );
                         message
                     }
                     other => panic!("{other:?}"),

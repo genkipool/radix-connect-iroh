@@ -11,7 +11,7 @@ use crate::{Role, diagnostics, protocol, requests};
 use iroh::TransportAddr;
 use iroh::endpoint::{Connection, PathEvent, RecvStream, SendStream};
 use n0_future::time::Instant;
-use n0_future::{StreamExt, time};
+use n0_future::{StreamExt, task, time};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use tokio::sync::{oneshot, watch};
@@ -193,8 +193,27 @@ pub(super) async fn receive(
         return true;
     };
     let flushing = Instant::now();
-    let acknowledged = answer.acknowledge(ACK_FLUSH_TIMEOUT).await;
-    drop(owed);
+    let Some(confirmation) = answer.confirm().await else {
+        drop(owed);
+        log_confirmation(Acknowledged::Failed, flushing);
+        return true;
+    };
+    // The next message is read at once: the peer's acknowledgement of this confirmation is
+    // awaited on the side (still counted in `acks_in_flight`, so closing waits for it), not
+    // before the next stream, which made each message of a burst wait one more round trip.
+    // At most one per stream the peer may have open, each for ACK_FLUSH_TIMEOUT at most.
+    task::spawn(
+        async move {
+            let acknowledged = confirmation.acknowledged(ACK_FLUSH_TIMEOUT).await;
+            drop(owed);
+            log_confirmation(acknowledged, flushing);
+        }
+        .instrument(tracing::Span::current()),
+    );
+    true
+}
+
+fn log_confirmation(acknowledged: Acknowledged, flushing: Instant) {
     match acknowledged {
         Acknowledged::Flushed => tracing::debug!(
             flush_ms = ms(flushing.elapsed()),
@@ -208,7 +227,6 @@ pub(super) async fn receive(
             "the host took a message but its confirmation could not be sent (the peer stopped waiting or the connection ended): the peer may send it again"
         ),
     }
-    true
 }
 
 /// A confirmation owed to the peer, counted in `acks_in_flight` from the moment the
