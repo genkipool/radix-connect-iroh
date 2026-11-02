@@ -250,7 +250,12 @@ impl IrohSession {
         }
         if let Some(memory) = link_memory.as_deref() {
             // A memory spoiled in storage must never keep the link from connecting.
-            config = config.clone().with_link_memory(memory).unwrap_or(config);
+            match config.clone().with_link_memory(memory) {
+                Ok(with_memory) => config = with_memory,
+                Err(error) => {
+                    tracing::warn!(error = %error, "ignored a link memory that cannot be read")
+                }
+            }
         }
         install_subscriber();
         let session = core::Session::start(&password, role, config)

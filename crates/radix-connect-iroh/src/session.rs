@@ -418,19 +418,15 @@ impl Session {
 
     /// What this session remembers of its link, for the host to store with it and give back
     /// to the link's next session ([`SessionConfig::with_link_memory`]): an opaque string with
-    /// no secret (the relay the peer was last seen on, when it was last connected and since when
-    /// the link is known). Read it
-    /// after a connection ([`ConnectionState::Connected`]) and when stopping the session.
+    /// no secret (the relay the peer was last seen on, when it was last connected, and since
+    /// when the link is known). Read it after a connection ([`ConnectionState::Connected`])
+    /// and when stopping the session.
     pub async fn link_memory(&self) -> String {
-        LinkMemory {
-            peer_relay: self
-                .peer_relay()
-                .await
-                .or_else(|| self.shared.config.peer_relay.clone()),
-            last_connected: self.shared.last_connected(),
-            known_since: self.shared.known_since,
-        }
-        .to_text()
+        let peer_relay = self
+            .peer_relay()
+            .await
+            .or_else(|| self.shared.config.peer_relay.clone());
+        self.shared.memory(peer_relay).to_text()
     }
 
     /// The relay the peer is on, as this end knows it (best while connected). A connector
@@ -940,22 +936,21 @@ impl Shared {
         }
     }
 
-    /// When the peer was last connected, as far as this session knows.
-    fn last_connected(&self) -> Option<u64> {
-        Some(self.last_connected.load(Ordering::Relaxed)).filter(|&at| at != 0)
+    /// What this session knows of its link now, with `peer_relay` as the peer's relay.
+    fn memory(&self, peer_relay: Option<RelayUrl>) -> LinkMemory {
+        LinkMemory {
+            peer_relay,
+            last_connected: Some(self.last_connected.load(Ordering::Relaxed)).filter(|&at| at != 0),
+            known_since: self.known_since,
+        }
     }
 
     /// The wallet's dialing schedule: [dormant](RetryPolicy::dormant) for a link whose connector
     /// has not been connected for [`DORMANT_AFTER`] (or never, in that long since the link is
     /// known), the regular one otherwise, a new link's included.
     fn retry_policy(&self) -> RetryPolicy {
-        let memory = LinkMemory {
-            peer_relay: None,
-            last_connected: self.last_connected(),
-            known_since: self.known_since,
-        };
         let dormant = link_memory::unix_now()
-            .and_then(|now| memory.since_last_seen(now))
+            .and_then(|now| self.memory(None).since_last_seen(now))
             .is_some_and(|since| since >= DORMANT_AFTER.as_secs());
         if dormant {
             self.config.retry.dormant()

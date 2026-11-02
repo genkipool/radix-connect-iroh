@@ -235,9 +235,10 @@ impl SessionConfig {
     }
 
     /// What the link's previous session remembered ([`Session::link_memory`](crate::Session::link_memory)),
-    /// as the host stored it: the relay the peer was last seen on (a connector knocks there)
-    /// and when it was last connected (a wallet dials a connector out of reach for a long time
-    /// only now and then, and waits for its knock). An empty string is no memory, as for a new
+    /// as the host stored it: the relay the peer was last seen on (a connector knocks there),
+    /// when it was last connected and since when the link is known (a wallet dials a connector
+    /// out of reach for a long time, or never reached, only now and then, and waits for its
+    /// knock). An empty string is no memory, as for a new
     /// link; one of a format this library does not know is ignored.
     ///
     /// # Errors
