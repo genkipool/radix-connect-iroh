@@ -6,7 +6,7 @@ plugins {
 
 group = "com.radixdlt.connect"
 // Overridable for local builds, e.g. -PradixConnectIroh.version=0.1.10-dev (publishToMavenLocal).
-version = providers.gradleProperty("radixConnectIroh.version").getOrElse("0.1.9")
+version = providers.gradleProperty("radixConnectIroh.version").getOrElse("0.1.10")
 
 val rustWorkspace: File = rootDir.parentFile
 val generatedJniLibs = layout.buildDirectory.dir("generated/jniLibs")

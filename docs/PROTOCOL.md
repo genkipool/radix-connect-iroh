@@ -241,7 +241,7 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   and over a relay its connection lingers on the wallet until QUIC's idle timeout (30 s), as
   seen after reloading the extension. So a wallet that takes a restarted knock while connected
   drops its connection, with error `5` (`restarted`), when it is at least 15 s old, and dials
-  at once; a younger one may be to the run that knocks (its knocks come within about 9 s of
+  at once (since 0.1.10 without the usual pause after a disconnection); a younger one may be to the run that knocks (its knocks come within about 9 s of
   its start), and stays. A wallet that predates it chooses the plain knock: nothing changes.
 - A wallet that predates knocks registers no ALPN and refuses the handshake; a connector
   that predates them never knocks. Either way the link works as before.
@@ -292,6 +292,17 @@ and drops the connection when it does not: a closed wallet, which says nothing, 
 gone within about 7 s instead of QUIC's 30, however its app was closed. A wallet that
 fails a check without being gone (frozen by the system, a moment without network) loses
 nothing — it redials, and lists its requests when it is back.
+
+For 8 s after the wallet says its app went to the background (since 0.1.10), the connector
+checks every 0.5 s instead, each check waiting three round trips (between 0.6 s and 1.5 s):
+an app closed from the recent apps screen goes to the background first, and its process then
+ends without a word, so it is known gone in under a second. Outside that window nothing
+changes; a wallet merely in the background answers and keeps its connection.
+
+How often a wallet dials is local to it and not part of the protocol: since 0.1.10 a wallet
+dials a connector it has not been connected to for a day (or never, for a day since it knows
+the link) once at the start and at each wake-up, and every 2 minutes otherwise; a knock still
+wakes it at once.
 
 Each end keeps at most 200 requests, dropping the oldest. An incomplete inventory sends
 nothing again. Only `interactionId`, `items.discriminator` and the answer's `discriminator`

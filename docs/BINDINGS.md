@@ -18,6 +18,13 @@ connection is checked, so one that died while the app was in the background is d
 and redialed within seconds instead of looking connected until it times out (30 s).
 Calls in quick succession are cheap: they share one check.
 
+Keep what a session remembers of its link (`linkMemory()`, an opaque string with no
+secret) with the link: read it once connected and when stopping the session, and give it
+back when starting the link's next session (since 0.1.10). A wallet then dials a connector
+that has not been connected for a day — an old browser, a removed extension — only now and
+then instead of again and again, and still connects at once when that connector knocks.
+A missing or unreadable memory only means the session starts as for a new link.
+
 Messages are the same UTF-8 JSON strings the WebRTC data channel carries after
 reassembly (wallet interactions, responses, `linkClient`, `accountList`, ledger
 messages). No chunking, no `packageType` envelope.
@@ -39,6 +46,7 @@ data class IrohSessionConfig(
     var relayUrl: String? = null,             // null = n0's public relays (default)
     var ackTimeoutMs: ULong = 10_000uL,
     var maxMessageSize: ULong = 8_388_608uL,
+    var linkMemory: String? = null,           // the link's previous linkMemory(); null for a new link
 )
 sealed class IrohException : Exception() {
     // InvalidPassword, InvalidRelayUrl(reason), Bind(reason), NotConnected, Timeout,
@@ -53,10 +61,12 @@ class IrohSession : AutoCloseable {          // close() frees the native object
     fun peerEndpointId(): String
     fun state(): IrohConnectionState
     fun diagnostics(): IrohDiagnostics        // connectivity snapshot; `summary` is one log line
+    suspend fun linkMemory(): String          // keep with the link, give back in IrohSessionConfig.linkMemory
     suspend fun send(message: String)         // throws IrohException; NotConnected immediately
     suspend fun nextEvent(): IrohSessionEvent? // null once shut down; taking a Message confirms it to the peer;
                                                // states come as their latest value
     suspend fun networkChanged()              // call from ConnectivityManager callbacks and on app resume
+    fun setInBackground(inBackground: Boolean) // wallet: tells the connector where the app is
     suspend fun shutdown()                    // tells the peer, idempotent; then close()
 }
 
@@ -97,11 +107,15 @@ type IrohErrorCode =
 
 class IrohSession {
   // relayUrl undefined/null = n0's public relays (default)
-  static start(password: Uint8Array, role: IrohRole, relayUrl?: string | null, ackTimeoutMs?: number | null): Promise<IrohSession>
+  // peerRelayUrl: the wallet's last relay (knocked at); soleHolder: an extension, the only holder of its links;
+  // linkMemory: the link's previous linkMemory()
+  static start(password: Uint8Array, role: IrohRole, relayUrl?: string | null, ackTimeoutMs?: number | null,
+               peerRelayUrl?: string | null, soleHolder?: boolean | null, linkMemory?: string | null): Promise<IrohSession>
   localEndpointId(): string
   peerEndpointId(): string
   state(): IrohConnectionState
   diagnostics(): IrohDiagnostics // connectivity snapshot; `summary` is one log line
+  linkMemory(): Promise<string> // keep with the link, give back to start()
   send(message: string): Promise<void>
   nextEvent(): Promise<IrohSessionEvent | undefined> // undefined once shut down; taking a message confirms it
   networkChanged(): Promise<void> // on `online`/`offline`, wake-up, extension becoming active
