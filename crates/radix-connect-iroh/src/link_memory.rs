@@ -20,7 +20,7 @@ use serde_json::{Map, Value, json};
 use iroh::RelayUrl;
 
 use crate::Error;
-use crate::config::parse_relay_url;
+use crate::config::{DORMANT_AFTER, parse_relay_url};
 
 /// The format of the string, written in it as `v`. A string of another version is not
 /// understood and is treated as no memory: the session works as for a new link.
@@ -99,6 +99,25 @@ impl LinkMemory {
             .or(self.known_since)
             .map(|at| now.saturating_sub(at))
     }
+
+    /// Whether the link is dormant at `now`: its peer has not been connected for
+    /// [`DORMANT_AFTER`] (or never, in that long since the link is known).
+    pub(crate) fn is_dormant(&self, now: u64) -> bool {
+        self.since_last_seen(now)
+            .is_some_and(|since| since >= DORMANT_AFTER.as_secs())
+    }
+}
+
+/// Whether the link whose memory ([`Session::link_memory`](crate::Session::link_memory)) is
+/// `text` is dormant: its peer has not been connected for a day (or never, in that long since
+/// the link is known), and its connector is most likely gone. A host that starts many links at
+/// once can start the others first, so that a radio just woken up carries the connections that
+/// will connect. No memory, or one that cannot be read, is not dormant (a new link).
+pub fn link_memory_is_dormant(text: &str) -> bool {
+    let Some(now) = unix_now() else {
+        return false;
+    };
+    LinkMemory::parse(text).is_ok_and(|memory| memory.is_dormant(now))
 }
 
 /// Seconds since the Unix epoch, or `None` when the clock is before it.
@@ -179,5 +198,34 @@ mod tests {
         };
         assert_eq!(never_connected.since_last_seen(160), Some(150));
         assert_eq!(LinkMemory::default().since_last_seen(160), None);
+    }
+
+    #[test]
+    fn a_link_out_of_reach_for_a_day_is_dormant() {
+        let now = unix_now().unwrap();
+        let day = DORMANT_AFTER.as_secs();
+        let memory = |last_connected: Option<u64>, known_since: Option<u64>| {
+            LinkMemory {
+                peer_relay: None,
+                last_connected,
+                known_since,
+            }
+            .to_text()
+        };
+        assert!(!link_memory_is_dormant(&memory(
+            Some(now - 60),
+            Some(now - 2 * day)
+        )));
+        assert!(link_memory_is_dormant(&memory(
+            Some(now - day - 60),
+            Some(now - 2 * day)
+        )));
+        // Never connected, known for a day; or known for a minute only.
+        assert!(link_memory_is_dormant(&memory(None, Some(now - day))));
+        assert!(!link_memory_is_dormant(&memory(None, Some(now - 60))));
+        // Nothing known, nothing readable: a new link.
+        assert!(!link_memory_is_dormant(&memory(None, None)));
+        assert!(!link_memory_is_dormant(""));
+        assert!(!link_memory_is_dormant("{not json"));
     }
 }

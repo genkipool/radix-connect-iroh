@@ -468,6 +468,14 @@ pub fn iroh_public_relay_urls() -> Vec<String> {
         .collect()
 }
 
+/// Whether the link whose memory (`IrohSession.linkMemory`) is `link_memory` is dormant: its
+/// connector has not been connected for a day (or never, in that long since the link is
+/// known). Starting many links at once, start the others first. Unreadable: not dormant.
+#[uniffi::export]
+pub fn iroh_link_memory_is_dormant(link_memory: String) -> bool {
+    core::link_memory_is_dormant(&link_memory)
+}
+
 /// Hex endpoint id of the `role` end of the link secured by `password`.
 #[uniffi::export]
 pub fn iroh_endpoint_id(password: Vec<u8>, role: IrohRole) -> Result<String, IrohError> {

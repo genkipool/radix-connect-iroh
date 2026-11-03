@@ -11,7 +11,7 @@ use n0_future::time::Instant;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tracing::Instrument;
 
-use crate::config::{DORMANT_AFTER, Relays, RetryPolicy};
+use crate::config::{Relays, RetryPolicy};
 use crate::diagnostics::{self, Diagnostics, PathKind, Tally, Traffic, ms};
 use crate::guard::PeerGuard;
 use crate::link_memory::{self, LinkMemory};
@@ -1051,12 +1051,10 @@ impl Shared {
     }
 
     /// The wallet's dialing schedule: [dormant](RetryPolicy::dormant) for a link whose connector
-    /// has not been connected for [`DORMANT_AFTER`] (or never, in that long since the link is
+    /// has not been connected for [`DORMANT_AFTER`](crate::config::DORMANT_AFTER) (or never, in that long since the link is
     /// known), the regular one otherwise, a new link's included.
     fn retry_policy(&self) -> RetryPolicy {
-        let dormant = link_memory::unix_now()
-            .and_then(|now| self.memory(None).since_last_seen(now))
-            .is_some_and(|since| since >= DORMANT_AFTER.as_secs());
+        let dormant = link_memory::unix_now().is_some_and(|now| self.memory(None).is_dormant(now));
         if dormant {
             self.config.retry.dormant()
         } else {
