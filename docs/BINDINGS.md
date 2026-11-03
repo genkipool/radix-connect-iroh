@@ -100,6 +100,11 @@ type IrohConnectionState = 'connecting' | 'connected' | 'disconnected'
 type IrohSessionEvent =
   | { type: 'stateChanged'; state: IrohConnectionState }
   | { type: 'message'; message: string }
+  // Connector only:
+  | { type: 'requestRedelivered'; interactionId: string } // a request the wallet lost was delivered again
+  | { type: 'peerPresence'; inBackground: boolean }        // the wallet's app went to the background or came back
+  | { type: 'peerRelay'; relayUrl: string }                // the wallet's relay (0.2.0): keep it as peerRelayUrl
+// More kinds may come in later versions: ignore the ones you do not know.
 type IrohErrorCode =
   | 'invalidPassword' | 'invalidRelayUrl' | 'bind' | 'notConnected' | 'timeout'
   | 'messageTooLarge' | 'rejected' | 'connectionLost' | 'closed' | 'internal'

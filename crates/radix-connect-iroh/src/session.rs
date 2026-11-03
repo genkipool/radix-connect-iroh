@@ -74,8 +74,10 @@ impl ConnectionState {
     }
 }
 
-/// Something that happened on a [`Session`].
+/// Something that happened on a [`Session`]. New kinds may be added in later versions:
+/// match it with a catch-all arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SessionEvent {
     /// The connection state changed.
     StateChanged(ConnectionState),
@@ -91,6 +93,11 @@ pub enum SessionEvent {
         /// Whether the wallet's app is in the background.
         in_background: bool,
     },
+    /// Connector: the wallet said which relay it is on (the first time in this session, or
+    /// another one since): the relay to keep with the link, for the next session's knocks
+    /// ([`SessionConfig::with_peer_relay`]). Also what [`Session::peer_relay`] returns from
+    /// now on.
+    PeerRelay(RelayUrl),
 }
 
 /// What the session tells the host besides states and messages.
@@ -98,6 +105,7 @@ pub enum SessionEvent {
 enum Notice {
     Redelivered(String),
     Presence(bool),
+    PeerRelay(RelayUrl),
 }
 
 /// A message waiting for the host. `taken` tells the stream that brought it to confirm
@@ -542,6 +550,7 @@ impl Session {
                     return Some(match notice {
                         Notice::Redelivered(id) => SessionEvent::RequestRedelivered(id),
                         Notice::Presence(in_background) => SessionEvent::PeerPresence { in_background },
+                        Notice::PeerRelay(relay) => SessionEvent::PeerRelay(relay),
                     });
                 }
                 delivery = messages.recv() => {
@@ -804,7 +813,8 @@ impl Shared {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if known.as_ref() != Some(&relay) {
             tracing::info!(relay = %Redacted(&relay), "the wallet says which relay it is on");
-            *known = Some(relay);
+            *known = Some(relay.clone());
+            let _ = self.notices.try_send(Notice::PeerRelay(relay));
         }
     }
 

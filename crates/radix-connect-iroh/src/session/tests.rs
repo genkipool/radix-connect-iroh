@@ -295,7 +295,18 @@ async fn the_connector_learns_the_relay_the_wallet_is_on_from_the_wallet() {
     .await
     .expect("the wallet never said which relay it is on");
     assert_eq!(connector.shared.peer_home_relay(), Some(relay_url.clone()));
-    assert_eq!(connector.peer_relay().await, Some(relay_url));
+    assert_eq!(connector.peer_relay().await, Some(relay_url.clone()));
+    // The host hears it, to keep it with the link.
+    let told = time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(SessionEvent::PeerRelay(relay)) = connector.next_event().await {
+                return relay;
+            }
+        }
+    })
+    .await
+    .expect("the host never heard the wallet's relay");
+    assert_eq!(told, relay_url);
 }
 
 #[tokio::test(flavor = "multi_thread")]

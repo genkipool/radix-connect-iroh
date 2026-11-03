@@ -32,6 +32,8 @@ export type IrohSessionEvent =
   | { type: 'requestRedelivered'; interactionId: string }
   /** The wallet's app went to the background, or came back. */
   | { type: 'peerPresence'; inBackground: boolean }
+  /** The wallet said which relay it is on: keep it with the link for the next session's knocks. */
+  | { type: 'peerRelay'; relayUrl: string }
 export type IrohErrorCode =
   | 'invalidPassword'
   | 'invalidRelayUrl'
@@ -122,7 +124,8 @@ fn state_name(state: core::ConnectionState) -> &'static str {
     }
 }
 
-fn event_to_js(event: core::SessionEvent) -> JsValue {
+/// The event for JavaScript, or `None` for a kind this binding does not know yet.
+fn event_to_js(event: core::SessionEvent) -> Option<JsValue> {
     let object = Object::new();
     let (kind, key, value): (&str, &str, JsValue) = match event {
         core::SessionEvent::StateChanged(state) => {
@@ -135,11 +138,13 @@ fn event_to_js(event: core::SessionEvent) -> JsValue {
         core::SessionEvent::PeerPresence { in_background } => {
             ("peerPresence", "inBackground", in_background.into())
         }
+        core::SessionEvent::PeerRelay(relay) => ("peerRelay", "relayUrl", relay.to_string().into()),
+        _ => return None,
     };
     // Setting properties on a fresh plain object cannot fail.
     let _ = Reflect::set(&object, &"type".into(), &kind.into());
     let _ = Reflect::set(&object, &key.into(), &value);
-    object.into()
+    Some(object.into())
 }
 
 fn diagnostics_to_js(diagnostics: core::Diagnostics) -> JsValue {
@@ -325,10 +330,13 @@ impl IrohSession {
     pub fn next_event(&self) -> Promise {
         let session = self.session.clone();
         future_to_promise(async move {
-            Ok(session
-                .next_event()
-                .await
-                .map_or(JsValue::UNDEFINED, event_to_js))
+            // A kind this binding does not know yet is skipped.
+            while let Some(event) = session.next_event().await {
+                if let Some(event) = event_to_js(event) {
+                    return Ok(event);
+                }
+            }
+            Ok(JsValue::UNDEFINED)
         })
     }
 

@@ -101,6 +101,8 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 Some(SessionEvent::PeerPresence { in_background }) => {
                     println!("peer-background {in_background}");
                 }
+                Some(SessionEvent::PeerRelay(relay)) => println!("peer-relay {relay}"),
+                Some(_) => {}
                 None => break,
             },
             line = stdin.next_line() => match line? {

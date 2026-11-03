@@ -111,16 +111,16 @@ pub enum IrohSessionEvent {
 
 impl IrohSessionEvent {
     /// The event for the host, or `None` for one only a connector hears (a request
-    /// delivered again, the wallet's presence): this binding runs the wallet's end.
+    /// delivered again, the wallet's presence or relay): this binding runs the wallet's end.
     fn from_core(event: core::SessionEvent) -> Option<Self> {
         match event {
             core::SessionEvent::StateChanged(state) => Some(Self::StateChanged {
                 state: state.into(),
             }),
             core::SessionEvent::Message(message) => Some(Self::Message { message }),
-            core::SessionEvent::RequestRedelivered(_) | core::SessionEvent::PeerPresence { .. } => {
-                None
-            }
+            // Only a connector hears the others (a request delivered again, the wallet's
+            // presence and relay), and any kind added later.
+            _ => None,
         }
     }
 }
