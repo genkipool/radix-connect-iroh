@@ -33,7 +33,7 @@ use crate::logging::Redacted;
 pub const ALPN: &[u8] = b"radix-connect/iroh/1";
 
 /// ALPN of a knock: a connector that just started tells its wallet, which dials it at once.
-/// Nothing travels over it: the wallet closes it with [`CloseCode::Knocked`] as soon as the
+/// Nothing travels over it: the wallet closes it with the "knocked" close code as soon as the
 /// handshake (which proves the connector's key) is done. A wallet that predates it refuses it.
 pub const KNOCK_ALPN: &[u8] = b"radix-connect/iroh/knock/1";
 
