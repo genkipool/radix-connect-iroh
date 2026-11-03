@@ -61,6 +61,8 @@ pub(super) async fn serve_streams(shared: &Shared, current: &Current) -> Option<
                             shared.heard_presence(in_background);
                         } else if let Some(inventory) = requests::read_inventory(bytes) {
                             shared.heard_inventory(current, &inventory);
+                        } else if let Some(relay) = protocol::read_home_relay(bytes) {
+                            shared.heard_home_relay(relay);
                         } else {
                             tracing::debug!("ignored a datagram of an unknown kind");
                         }

@@ -284,6 +284,34 @@ async fn heard(connector: &Session, in_background: bool) {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_connector_learns_the_relay_the_wallet_is_on_from_the_wallet() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, _wallet) = connected_pair(&relay_url, &password(32)).await;
+    time::timeout(Duration::from_secs(10), async {
+        while connector.shared.peer_home_relay().is_none() {
+            time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the wallet never said which relay it is on");
+    assert_eq!(connector.shared.peer_home_relay(), Some(relay_url.clone()));
+    assert_eq!(connector.peer_relay().await, Some(relay_url));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_connector_keeps_no_relay_the_wallet_names_that_is_none_of_its_own() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, _wallet) = connected_pair(&relay_url, &password(33)).await;
+    connector
+        .shared
+        .heard_home_relay("https://elsewhere.example.com/".parse().unwrap());
+    assert_ne!(
+        connector.shared.peer_home_relay(),
+        Some("https://elsewhere.example.com/".parse().unwrap())
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_connector_hears_whether_the_wallet_app_is_in_the_background() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(31);

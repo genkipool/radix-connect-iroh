@@ -18,6 +18,7 @@
 
 use std::time::Duration;
 
+use iroh::RelayUrl;
 use iroh::endpoint::{
     Connection, ReadError, ReadExactError, ReadToEndError, RecvStream, SendStream, VarInt,
     WriteError,
@@ -59,6 +60,34 @@ pub(crate) fn presence(in_background: bool) -> [u8; 2] {
 pub(crate) fn read_presence(datagram: &[u8]) -> Option<bool> {
     match datagram {
         [PRESENCE, state] => Some(*state != 0),
+        _ => None,
+    }
+}
+
+/// First byte of a home relay datagram: the wallet says which relay it is reachable on (its
+/// home relay), followed by that relay's URL. The connector keeps it as the link's relay hint:
+/// its next session knocks there. Learnt from the connection instead, a connector could take
+/// the relay that carried the connection (its own, when the wallet came to it) for the
+/// wallet's, and its knocks would never reach the wallet. A connector that predates it ignores
+/// it, as any datagram of an unknown kind.
+const HOME_RELAY: u8 = 0x52;
+
+/// The longest relay URL a home relay datagram carries.
+const MAX_HOME_RELAY_URL: usize = 512;
+
+/// The home relay datagram for `relay`, or `None` for a URL too long to carry.
+pub(crate) fn home_relay(relay: &RelayUrl) -> Option<Vec<u8>> {
+    let url = relay.as_str().as_bytes();
+    (url.len() <= MAX_HOME_RELAY_URL).then(|| [&[HOME_RELAY][..], url].concat())
+}
+
+/// Whether a datagram is a home relay one, and the relay it names. Only a well-formed URL:
+/// which relays a connector accepts is for the session to check.
+pub(crate) fn read_home_relay(datagram: &[u8]) -> Option<RelayUrl> {
+    match datagram {
+        [HOME_RELAY, url @ ..] if url.len() <= MAX_HOME_RELAY_URL => {
+            std::str::from_utf8(url).ok()?.parse().ok()
+        }
         _ => None,
     }
 }
@@ -540,6 +569,22 @@ mod tests {
         });
         let server_conn = server_conn.unwrap();
         (relay, server, client, client_conn.unwrap(), server_conn)
+    }
+
+    #[test]
+    fn a_home_relay_datagram_names_its_relay() {
+        let relay: RelayUrl = "https://euc1-1.relay.n0.iroh.link./".parse().unwrap();
+        let datagram = home_relay(&relay).unwrap();
+        assert_eq!(read_home_relay(&datagram), Some(relay));
+        // Not one: the other kinds, an empty URL, bytes that are no URL, one too long.
+        assert_eq!(read_home_relay(&presence(true)), None);
+        assert_eq!(read_home_relay(&[HOME_RELAY]), None);
+        assert_eq!(read_home_relay(&[HOME_RELAY, 0xff, 0xfe]), None);
+        let long = format!("https://{}.example.com/", "a".repeat(MAX_HOME_RELAY_URL));
+        assert_eq!(home_relay(&long.parse().unwrap()), None);
+        let mut too_long = vec![HOME_RELAY];
+        too_long.extend_from_slice(long.as_bytes());
+        assert_eq!(read_home_relay(&too_long), None);
     }
 
     async fn read_one(conn: &Connection) -> Result<Incoming, ReadToEndError> {

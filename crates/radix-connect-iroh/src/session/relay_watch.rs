@@ -71,6 +71,8 @@ impl RelayLog {
             );
             self.since = now;
             self.warned = false;
+            // A wallet that connected before it had a relay tells it now.
+            shared.home_relay_changed();
             // Back after an outage (it was home before): see `knock_when_relay_returns`.
             if self.home.is_some() {
                 shared
@@ -85,6 +87,7 @@ impl RelayLog {
             }
         } else if connected && url != self.home {
             tracing::info!(relay, "moved to another relay");
+            shared.home_relay_changed();
         } else if !connected && self.connected {
             tracing::warn!(
                 relay,

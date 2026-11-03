@@ -258,7 +258,11 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
   QR, and dials it then.
 - On n0's public relays the wallet publishes no address (§4): the connector can only knock
   at a relay it remembers, which costs the phone nothing and publishes nothing new. A
-  wrong or outdated relay only means the knock does not arrive.
+  wrong or outdated relay only means the knock does not arrive. The relay it remembers is
+  the one the wallet says it is on (§7.2, since 0.1.12): learnt from the connection
+  instead, it could be the relay that carried the connection — the connector's own, when
+  the wallet came to it there — and a wrong one was never corrected, since each knock sent
+  there made it look known.
 
 ### 7.2 Presence and request inventory (datagrams)
 
@@ -273,6 +277,10 @@ does not know, and nothing else changes.
 - **Request inventory** (since 0.1.5): `0x49`, a flags byte (`0x01`: every request is
   listed), then 8 bytes per request the wallet holds: the first 8 bytes of the BLAKE3 hash
   of its `interactionId`, at most 100.
+- **Home relay** (since 0.1.12): `0x52` then the URL of the relay the wallet is reachable
+  on (UTF-8, at most 512 bytes), on every connection and again whenever the wallet gets a
+  relay or moves to another. The connector keeps it only if it is one of its own relays
+  (n0's public ones, or its custom relay): it knocks there, and nowhere else.
 
 A wallet keeps the dApp requests it received in memory, and loses them when its app is
 closed or the system ends it — which the connector cannot see: the process runs no more

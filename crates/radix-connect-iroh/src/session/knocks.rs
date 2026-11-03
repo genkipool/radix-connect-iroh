@@ -156,7 +156,7 @@ pub(super) async fn answer_knocks(shared: &Shared) {
 /// wallet has not connected — if it knows where the wallet is (a custom relay, or the hint of
 /// [`SessionConfig::with_peer_relay`]). Returns when done.
 pub(super) async fn knock_on_start(shared: &Shared) {
-    let Some(relay) = shared.config.knock_relay().cloned() else {
+    let Some(relay) = shared.knock_relay() else {
         return;
     };
     #[cfg(test)]
@@ -184,9 +184,9 @@ pub(super) async fn knock_on_start(shared: &Shared) {
 /// "restarted" for a sole holder: this end's connection is gone, so a connection the wallet
 /// still holds to it is dead. Returns when the session closes.
 pub(super) async fn knock_when_relay_returns(shared: &Shared) {
-    let Some(relay) = shared.config.knock_relay().cloned() else {
+    if !shared.config.knocks {
         return;
-    };
+    }
     let mut regained = shared.relay_regained.subscribe();
     loop {
         tokio::select! {
@@ -211,6 +211,10 @@ pub(super) async fn knock_when_relay_returns(shared: &Shared) {
         if !dropped {
             continue;
         }
+        // Where the wallet said it is, if it did in this session: the hint may be stale.
+        let Some(relay) = shared.knock_relay() else {
+            continue;
+        };
         tracing::info!("the relay is back and the wallet is not connected: knocking for it");
         knock_round(shared, &relay, Instant::now()).await;
         // A relay that came back again during the round: this round was for it.

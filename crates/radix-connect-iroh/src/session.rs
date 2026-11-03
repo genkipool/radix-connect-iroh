@@ -208,6 +208,9 @@ struct Shared {
     in_background: AtomicBool,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
+    /// Connector: the relay the wallet last said it is reachable on (one of this session's
+    /// relays): where its knocks go, and the link's relay hint.
+    peer_home_relay: std::sync::Mutex<Option<RelayUrl>>,
     /// When the peer was last connected (Unix seconds; 0: not known), from the link memory
     /// given back, then each connection: kept in the memory, and with `known_since` what
     /// makes a wallet treat a link as dormant (see `RetryPolicy::dormant`).
@@ -345,6 +348,7 @@ impl Session {
             unauthorized,
             in_background: AtomicBool::new(false),
             peer_in_background: AtomicBool::new(false),
+            peer_home_relay: std::sync::Mutex::default(),
             last_connected,
             known_since,
             went_to_background: watch::Sender::new(0),
@@ -435,8 +439,13 @@ impl Session {
 
     /// The relay the peer is on, as this end knows it (best while connected). A connector
     /// keeps its wallet's as the link's relay hint, for [`SessionConfig::with_peer_relay`]:
-    /// the next session knocks there.
+    /// the next session knocks there. The relay the wallet says it is on, once it did;
+    /// before that (or with a wallet that predates it) a relay the connection knows the peer
+    /// by, which may be the one that carried the connection rather than the wallet's own.
     pub async fn peer_relay(&self) -> Option<RelayUrl> {
+        if let Some(told) = self.shared.peer_home_relay() {
+            return Some(told);
+        }
         let info = self.shared.endpoint.remote_info(self.shared.peer).await?;
         info.addrs().find_map(|addr| match addr.addr() {
             TransportAddr::Relay(url) => Some(url.clone()),
@@ -655,6 +664,7 @@ impl Shared {
             return;
         }
         tracing::debug!(in_background, "told the peer the app's presence");
+        self.tell_home_relay(connection);
         let inventory = self.lock_held().inventory();
         let _ = connection.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
         let again = connection.clone();
@@ -733,6 +743,87 @@ impl Shared {
                 .instrument(span),
             );
         }
+    }
+
+    /// Wallet: tells the connector the relay it is reachable on, when it has one (twice, a
+    /// moment apart, as its presence). Again whenever it gets a relay or moves to another.
+    fn tell_home_relay(&self, connection: &iroh::endpoint::Connection) {
+        if self.role != Role::Wallet {
+            return;
+        }
+        let Some(datagram) = self
+            .endpoint
+            .addr()
+            .relay_urls()
+            .next()
+            .and_then(protocol::home_relay)
+        else {
+            return;
+        };
+        if connection
+            .send_datagram(bytes::Bytes::copy_from_slice(&datagram))
+            .is_err()
+        {
+            return;
+        }
+        tracing::debug!("told the peer the relay this end is on");
+        let again = connection.clone();
+        task::spawn(async move {
+            time::sleep(Duration::from_millis(250)).await;
+            let _ = again.send_datagram(bytes::Bytes::from(datagram));
+        });
+    }
+
+    /// Wallet: this end got a relay, or moved to another: tells the connector, if connected.
+    fn home_relay_changed(&self) {
+        if let Some(current) = self.connection.borrow().clone() {
+            self.tell_home_relay(&current.connection);
+        }
+    }
+
+    /// Connector: the wallet said it is reachable on `relay`. Kept only if it is one of this
+    /// session's relays: a knock goes nowhere else.
+    fn heard_home_relay(&self, relay: RelayUrl) {
+        let ours = match &self.config.relays {
+            Relays::Custom(url) => *url == relay,
+            // The relays the endpoint was built with (see `with_relays`).
+            Relays::Public => iroh::endpoint::default_relay_mode()
+                .relay_map()
+                .contains(&relay),
+        };
+        if !ours {
+            tracing::debug!(
+                relay = %Redacted(&relay),
+                "ignored the relay the wallet says it is on: not one of this end's relays"
+            );
+            return;
+        }
+        let mut known = self
+            .peer_home_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if known.as_ref() != Some(&relay) {
+            tracing::info!(relay = %Redacted(&relay), "the wallet says which relay it is on");
+            *known = Some(relay);
+        }
+    }
+
+    /// Connector: the relay the wallet last said it is on.
+    fn peer_home_relay(&self) -> Option<RelayUrl> {
+        self.peer_home_relay
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Connector: where to knock for the wallet now: the relay it said it is on in this
+    /// session, else the hint the session started with (see [`SessionConfig::knock_relay`]).
+    fn knock_relay(&self) -> Option<RelayUrl> {
+        let configured = self.config.knock_relay().cloned();
+        if !self.config.knocks || matches!(self.config.relays, Relays::Custom(_)) {
+            return configured;
+        }
+        self.peer_home_relay().or(configured)
     }
 
     /// Connector: what the wallet said of its app.
