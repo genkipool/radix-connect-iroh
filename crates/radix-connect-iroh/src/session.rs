@@ -100,6 +100,36 @@ pub enum SessionEvent {
     PeerRelay(RelayUrl),
 }
 
+/// Where a session's own short tasks run, whatever thread asks for one: the runtime the
+/// session was started on. A host may call [`Session::set_in_background`] from a thread of its
+/// own — the Kotlin binding does, from the app's threads — where spawning on the current
+/// runtime fails (there is none), and the copies of the presence were never sent.
+#[derive(Debug, Clone)]
+struct Spawner {
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    runtime: tokio::runtime::Handle,
+}
+
+impl Spawner {
+    /// The runtime of the caller: call it from the session's start.
+    fn current() -> Self {
+        Self {
+            #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+            runtime: tokio::runtime::Handle::current(),
+        }
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) {
+        drop(self.runtime.spawn(future));
+    }
+
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    fn spawn(&self, future: impl Future<Output = ()> + 'static) {
+        drop(task::spawn(future));
+    }
+}
+
 /// When the wallet sends its presence again after telling it, each time with the state at
 /// that moment. A datagram may be lost, and losses come in bursts (measured: 2 of 15 notices
 /// lost, both copies 250 ms apart, on a phone whose app had just gone to the background over
@@ -226,6 +256,8 @@ struct Shared {
     in_background: Arc<AtomicBool>,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
+    /// Runs the session's short tasks (the copies of the presence) from any thread.
+    spawner: Spawner,
     /// Connector: the relay the wallet last said it is reachable on (one of this session's
     /// relays): where its knocks go, and the link's relay hint.
     peer_home_relay: std::sync::Mutex<Option<RelayUrl>>,
@@ -366,6 +398,7 @@ impl Session {
             unauthorized,
             in_background: Arc::default(),
             peer_in_background: AtomicBool::new(false),
+            spawner: Spawner::current(),
             peer_home_relay: std::sync::Mutex::default(),
             last_connected,
             known_since,
@@ -688,7 +721,7 @@ impl Shared {
         let _ = connection.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
         let again = connection.clone();
         let state = Arc::clone(&self.in_background);
-        task::spawn(async move {
+        self.spawner.spawn(async move {
             let mut waited = Duration::ZERO;
             for (repeat, at) in PRESENCE_REPEATS.into_iter().enumerate() {
                 time::sleep(at.saturating_sub(waited)).await;
@@ -801,7 +834,7 @@ impl Shared {
         }
         tracing::debug!("told the peer the relay this end is on");
         let again = connection.clone();
-        task::spawn(async move {
+        self.spawner.spawn(async move {
             time::sleep(Duration::from_millis(250)).await;
             let _ = again.send_datagram(bytes::Bytes::from(datagram));
         });

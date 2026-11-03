@@ -58,6 +58,7 @@ pub(super) async fn serve_streams(shared: &Shared, current: &Current) -> Option<
                 match datagram.as_deref() {
                     Ok(bytes) => {
                         if let Some(in_background) = protocol::read_presence(bytes) {
+                            tracing::debug!(in_background, "heard the wallet's presence");
                             shared.heard_presence(in_background);
                         } else if let Some(inventory) = requests::read_inventory(bytes) {
                             shared.heard_inventory(current, &inventory);

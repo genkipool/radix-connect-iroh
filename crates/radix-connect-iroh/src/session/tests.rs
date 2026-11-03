@@ -323,6 +323,21 @@ async fn a_connector_keeps_no_relay_the_wallet_names_that_is_none_of_its_own() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn the_wallet_tells_its_presence_from_a_thread_outside_its_runtime() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(35)).await;
+    let wallet = Arc::new(wallet);
+
+    // As the Kotlin binding does, from one of the app's threads.
+    let from_app = Arc::clone(&wallet);
+    std::thread::spawn(move || from_app.set_in_background(true))
+        .join()
+        .expect("telling the presence from a thread of the host's own panicked");
+
+    heard(&connector, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_late_copy_of_the_presence_never_undoes_a_newer_one() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let (connector, wallet) = connected_pair(&relay_url, &password(34)).await;
