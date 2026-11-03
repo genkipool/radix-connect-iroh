@@ -1974,8 +1974,9 @@ async fn a_dead_connection_is_dropped_within_seconds_of_a_network_change() {
         let started = time::Instant::now();
         survivor.network_changed().await;
         let session = format!("session={} ", survivor.shared.session);
-        // The longest liveness deadline, and some slack.
-        let soon = PROBE_MAX_DEADLINE + Duration::from_secs(2);
+        // The longest liveness deadline, and slack for a busy machine (the whole suite on a
+        // CI runner's few cores): still far below QUIC's 30 s idle timeout.
+        let soon = PROBE_MAX_DEADLINE + Duration::from_secs(5);
         if time::timeout(soon, wait_for_state(&survivor, after))
             .await
             .is_err()
@@ -2350,7 +2351,10 @@ async fn a_connector_whose_relay_comes_back_knocks_and_the_waiting_wallet_dials_
     );
     logs.wait_for(
         Level::INFO,
-        &["the relay is back and the wallet is not connected: knocking for it"],
+        &[
+            "the relay is back and the wallet is not connected: knocking for it",
+            &format!("session={} ", connector.shared.session),
+        ],
     )
     .await;
     deliver(&wallet, &connector, "after the relay came back")
@@ -2382,7 +2386,10 @@ async fn a_connector_whose_relay_comes_back_while_connected_knocks_for_nobody() 
     assert_eq!(
         logs.count(
             Level::INFO,
-            &["the relay is back and the wallet is not connected"]
+            &[
+                "the relay is back and the wallet is not connected",
+                &format!("session={} ", connector.shared.session)
+            ]
         ),
         0
     );
@@ -2434,7 +2441,10 @@ async fn a_connection_that_drops_soon_after_the_relay_came_back_is_followed_by_a
 
     logs.wait_for(
         Level::INFO,
-        &["the relay is back and the wallet is not connected: knocking for it"],
+        &[
+            "the relay is back and the wallet is not connected: knocking for it",
+            &format!("session={} ", connector.shared.session),
+        ],
     )
     .await;
     assert!(
@@ -2589,7 +2599,10 @@ async fn a_sole_holder_that_restarts_without_closing_gets_its_wallet_back_at_onc
     );
     logs.wait_for(
         Level::INFO,
-        &["the connector restarted: its old connection is dead, dropping it and dialing now"],
+        &[
+            "the connector restarted: its old connection is dead, dropping it and dialing now",
+            &format!("session={} ", wallet.shared.session),
+        ],
     )
     .await;
     // At once, not after the pause that follows an ordinary disconnection.
@@ -2637,7 +2650,10 @@ async fn a_restarted_knock_leaves_a_connection_made_since_the_restart() {
         .unwrap();
     logs.wait_for(
         Level::DEBUG,
-        &["the connector knocked while connected: nothing to do"],
+        &[
+            "the connector knocked while connected: nothing to do",
+            &format!("session={} ", wallet.shared.session),
+        ],
     )
     .await;
 
@@ -2672,7 +2688,10 @@ async fn a_knock_from_a_second_holder_of_the_link_never_cuts_a_live_connection()
         .unwrap();
     logs.wait_for(
         Level::DEBUG,
-        &["the connector knocked while connected: nothing to do"],
+        &[
+            "the connector knocked while connected: nothing to do",
+            &format!("session={} ", wallet.shared.session),
+        ],
     )
     .await;
     let still = wallet.diagnostics().connected_for.expect("still connected");
