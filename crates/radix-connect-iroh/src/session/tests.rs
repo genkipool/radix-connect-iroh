@@ -323,6 +323,22 @@ async fn a_connector_keeps_no_relay_the_wallet_names_that_is_none_of_its_own() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_late_copy_of_the_presence_never_undoes_a_newer_one() {
+    let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
+    let (connector, wallet) = connected_pair(&relay_url, &password(34)).await;
+
+    // Away and back at once: the copies sent later say where the app is then.
+    wallet.set_in_background(true);
+    wallet.set_in_background(false);
+    time::sleep(Duration::from_millis(3_500)).await;
+
+    assert!(
+        !connector.peer_in_background(),
+        "a copy of the earlier presence arrived after the newer one"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_connector_hears_whether_the_wallet_app_is_in_the_background() {
     let (_relay_map, relay_url, _relay) = run_relay_server().await.unwrap();
     let link = password(31);

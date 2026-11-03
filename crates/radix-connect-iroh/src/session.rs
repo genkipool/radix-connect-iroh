@@ -100,6 +100,16 @@ pub enum SessionEvent {
     PeerRelay(RelayUrl),
 }
 
+/// When the wallet sends its presence again after telling it, each time with the state at
+/// that moment. A datagram may be lost, and losses come in bursts (measured: 2 of 15 notices
+/// lost, both copies 250 ms apart, on a phone whose app had just gone to the background over
+/// a direct Wi-Fi path): copies seconds apart reach a connector the first ones did not.
+const PRESENCE_REPEATS: [Duration; 3] = [
+    Duration::from_millis(250),
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+];
+
 /// What the session tells the host besides states and messages.
 #[derive(Debug)]
 enum Notice {
@@ -213,7 +223,7 @@ struct Shared {
     unauthorized: Arc<std::sync::Mutex<Tally>>,
     /// Wallet: whether its app is in the background, as the host said; told to the connector
     /// on every connection.
-    in_background: AtomicBool,
+    in_background: Arc<AtomicBool>,
     /// Connector: whether the wallet last said its app is in the background.
     peer_in_background: AtomicBool,
     /// Connector: the relay the wallet last said it is reachable on (one of this session's
@@ -354,7 +364,7 @@ impl Session {
             received: AtomicU64::new(0),
             relay,
             unauthorized,
-            in_background: AtomicBool::new(false),
+            in_background: Arc::default(),
             peer_in_background: AtomicBool::new(false),
             peer_home_relay: std::sync::Mutex::default(),
             last_connected,
@@ -677,10 +687,24 @@ impl Shared {
         let inventory = self.lock_held().inventory();
         let _ = connection.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
         let again = connection.clone();
+        let state = Arc::clone(&self.in_background);
         task::spawn(async move {
-            time::sleep(Duration::from_millis(250)).await;
-            let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&datagram));
-            let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
+            let mut waited = Duration::ZERO;
+            for (repeat, at) in PRESENCE_REPEATS.into_iter().enumerate() {
+                time::sleep(at.saturating_sub(waited)).await;
+                waited = at;
+                // The state now, not the one told: a late copy never undoes a newer change.
+                let now = protocol::presence(state.load(Ordering::Relaxed));
+                if again
+                    .send_datagram(bytes::Bytes::copy_from_slice(&now))
+                    .is_err()
+                {
+                    return;
+                }
+                if repeat == 0 {
+                    let _ = again.send_datagram(bytes::Bytes::copy_from_slice(&inventory));
+                }
+            }
         });
     }
 
