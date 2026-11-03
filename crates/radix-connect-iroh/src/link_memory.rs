@@ -109,15 +109,21 @@ impl LinkMemory {
 }
 
 /// Whether the link whose memory ([`Session::link_memory`](crate::Session::link_memory)) is
-/// `text` is dormant: its peer has not been connected for a day (or never, in that long since
-/// the link is known), and its connector is most likely gone. A host that starts many links at
-/// once can start the others first, so that a radio just woken up carries the connections that
-/// will connect. No memory, or one that cannot be read, is not dormant (a new link).
-pub fn link_memory_is_dormant(text: &str) -> bool {
-    let Some(now) = unix_now() else {
-        return false;
+/// `text` has been connected lately: in the last day. A host that starts many links at once
+/// starts these first, and the others (never connected, or not for a day: their connectors are
+/// most likely gone) a moment later, so that a radio just woken up carries the connections that
+/// will connect. No memory, or one that cannot be read, counts as connected lately: such a link
+/// starts at once, as before.
+pub fn link_memory_connected_lately(text: &str) -> bool {
+    let (Some(now), Ok(memory)) = (unix_now(), LinkMemory::parse(text)) else {
+        return true;
     };
-    LinkMemory::parse(text).is_ok_and(|memory| memory.is_dormant(now))
+    if memory.last_connected.is_none() && memory.known_since.is_none() {
+        return true;
+    }
+    memory
+        .last_connected
+        .is_some_and(|at| now.saturating_sub(at) < DORMANT_AFTER.as_secs())
 }
 
 /// Seconds since the Unix epoch, or `None` when the clock is before it.
@@ -201,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn a_link_out_of_reach_for_a_day_is_dormant() {
+    fn a_link_connected_in_the_last_day_is_connected_lately() {
         let now = unix_now().unwrap();
         let day = DORMANT_AFTER.as_secs();
         let memory = |last_connected: Option<u64>, known_since: Option<u64>| {
@@ -212,20 +218,19 @@ mod tests {
             }
             .to_text()
         };
-        assert!(!link_memory_is_dormant(&memory(
+        assert!(link_memory_connected_lately(&memory(
             Some(now - 60),
             Some(now - 2 * day)
         )));
-        assert!(link_memory_is_dormant(&memory(
+        assert!(!link_memory_connected_lately(&memory(
             Some(now - day - 60),
             Some(now - 2 * day)
         )));
-        // Never connected, known for a day; or known for a minute only.
-        assert!(link_memory_is_dormant(&memory(None, Some(now - day))));
-        assert!(!link_memory_is_dormant(&memory(None, Some(now - 60))));
-        // Nothing known, nothing readable: a new link.
-        assert!(!link_memory_is_dormant(&memory(None, None)));
-        assert!(!link_memory_is_dormant(""));
-        assert!(!link_memory_is_dormant("{not json"));
+        // Never connected since it is known, however recently.
+        assert!(!link_memory_connected_lately(&memory(None, Some(now - 60))));
+        // Nothing known, nothing readable: starts at once, as before.
+        assert!(link_memory_connected_lately(&memory(None, None)));
+        assert!(link_memory_connected_lately(""));
+        assert!(link_memory_connected_lately("{not json"));
     }
 }

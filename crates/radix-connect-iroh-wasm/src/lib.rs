@@ -417,11 +417,13 @@ pub fn endpoint_id(
 }
 
 /// Checks a relay URL the user typed. Returns why it is not usable, or `undefined`.
-/// Whether the link whose memory (`linkMemory()`) is `linkMemory` is dormant: its peer has
-/// not been connected for a day (or never, in that long since the link is known).
-#[wasm_bindgen(js_name = linkMemoryIsDormant)]
-pub fn link_memory_is_dormant(#[wasm_bindgen(js_name = linkMemory)] link_memory: String) -> bool {
-    core::link_memory_is_dormant(&link_memory)
+/// Whether the link whose memory (`linkMemory()`) is `linkMemory` was connected in the last
+/// day. No memory, or an unreadable one: true.
+#[wasm_bindgen(js_name = linkMemoryConnectedLately)]
+pub fn link_memory_connected_lately(
+    #[wasm_bindgen(js_name = linkMemory)] link_memory: String,
+) -> bool {
+    core::link_memory_connected_lately(&link_memory)
 }
 
 #[wasm_bindgen(js_name = validateRelayUrl)]

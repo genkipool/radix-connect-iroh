@@ -73,7 +73,7 @@ class IrohSession : AutoCloseable {          // close() frees the native object
 fun irohPublicRelayUrls(): List<String>  // for display
 fun irohEndpointId(password: ByteArray, role: IrohRole): String
 fun irohValidateRelayUrl(relayUrl: String): String? // null when usable, else the reason
-fun irohLinkMemoryIsDormant(linkMemory: String): Boolean // no connection in a day: start such links after the others
+fun irohLinkMemoryConnectedLately(linkMemory: String): Boolean // connected in the last day: start these first
 
 enum class IrohLogLevel { ERROR, WARN, INFO, DEBUG, TRACE }
 interface IrohLogSink { fun log(level: IrohLogLevel, target: String, message: String) }
@@ -131,7 +131,7 @@ class IrohSession {
 function publicRelayUrls(): string[] // for display
 function endpointId(password: Uint8Array, role: IrohRole): string
 function validateRelayUrl(relayUrl: string): string | undefined // undefined when usable
-function linkMemoryIsDormant(linkMemory: string): boolean // no connection in a day: start such links after the others
+function linkMemoryConnectedLately(linkMemory: string): boolean // connected in the last day: start these first
 function setLogger(logger: (level: string, target: string, message: string) => void, maxLevel: 'error' | 'warn' | 'info' | 'debug' | 'trace'): void
 ```
 
