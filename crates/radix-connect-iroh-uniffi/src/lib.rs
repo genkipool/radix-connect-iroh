@@ -476,6 +476,20 @@ pub fn iroh_link_memory_connected_lately(link_memory: String) -> bool {
     core::link_memory_connected_lately(&link_memory)
 }
 
+/// Whether a host starting many links at once (a cold start, the app back in the front) starts
+/// the link whose stored memory is `link_memory` (null for a new link) at once. The others start
+/// once those are connected, or after `irohLaterLinksHeadStartMs()` at most.
+#[uniffi::export]
+pub fn iroh_link_starts_at_once(link_memory: Option<String>) -> bool {
+    core::link_starts_at_once(link_memory.as_deref())
+}
+
+/// How long, at most, the links that do not start at once wait for the others to connect.
+#[uniffi::export]
+pub fn iroh_later_links_head_start_ms() -> u64 {
+    core::LATER_LINKS_HEAD_START.as_millis() as u64
+}
+
 /// Hex endpoint id of the `role` end of the link secured by `password`.
 #[uniffi::export]
 pub fn iroh_endpoint_id(password: Vec<u8>, role: IrohRole) -> Result<String, IrohError> {

@@ -62,6 +62,6 @@ pub use diagnostics::{Diagnostics, PathKind};
 pub use error::{Error, SendError};
 pub use iroh::EndpointId;
 pub use keys::{ConnectionPassword, Role};
-pub use link_memory::link_memory_connected_lately;
+pub use link_memory::{LATER_LINKS_HEAD_START, link_memory_connected_lately, link_starts_at_once};
 pub use protocol::{ALPN, KNOCK_ALPN, KNOCK_RESTARTED_ALPN};
 pub use session::{ConnectionState, Session, SessionEvent};

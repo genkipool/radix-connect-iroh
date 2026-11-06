@@ -426,6 +426,22 @@ pub fn link_memory_connected_lately(
     core::link_memory_connected_lately(&link_memory)
 }
 
+/// Whether a host starting many links at once starts the link whose stored memory is
+/// `linkMemory` (undefined for a new link) at once. The others start once those are connected,
+/// or after `laterLinksHeadStartMs()` at most.
+#[wasm_bindgen(js_name = linkStartsAtOnce)]
+pub fn link_starts_at_once(
+    #[wasm_bindgen(js_name = linkMemory)] link_memory: Option<String>,
+) -> bool {
+    core::link_starts_at_once(link_memory.as_deref())
+}
+
+/// How long, at most, the links that do not start at once wait for the others to connect.
+#[wasm_bindgen(js_name = laterLinksHeadStartMs)]
+pub fn later_links_head_start_ms() -> u32 {
+    core::LATER_LINKS_HEAD_START.as_millis() as u32
+}
+
 #[wasm_bindgen(js_name = validateRelayUrl)]
 pub fn validate_relay_url(#[wasm_bindgen(js_name = relayUrl)] relay_url: String) -> Option<String> {
     core::SessionConfig::new(&relay_url)

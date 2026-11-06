@@ -74,6 +74,8 @@ fun irohPublicRelayUrls(): List<String>  // for display
 fun irohEndpointId(password: ByteArray, role: IrohRole): String
 fun irohValidateRelayUrl(relayUrl: String): String? // null when usable, else the reason
 fun irohLinkMemoryConnectedLately(linkMemory: String): Boolean // connected in the last day: start these first
+fun irohLinkStartsAtOnce(linkMemory: String?): Boolean // starting many links: this one now (see "Rules for hosts")
+fun irohLaterLinksHeadStartMs(): ULong                 // the others wait for those at most this long
 
 enum class IrohLogLevel { ERROR, WARN, INFO, DEBUG, TRACE }
 interface IrohLogSink { fun log(level: IrohLogLevel, target: String, message: String) }
@@ -132,8 +134,33 @@ function publicRelayUrls(): string[] // for display
 function endpointId(password: Uint8Array, role: IrohRole): string
 function validateRelayUrl(relayUrl: string): string | undefined // undefined when usable
 function linkMemoryConnectedLately(linkMemory: string): boolean // connected in the last day: start these first
+function linkStartsAtOnce(linkMemory?: string | null): boolean // starting many links: this one now (see "Rules for hosts")
+function laterLinksHeadStartMs(): number // the others wait for those at most this long
 function setLogger(logger: (level: string, target: string, message: string) => void, maxLevel: 'error' | 'warn' | 'info' | 'debug' | 'trace'): void
 ```
+
+## Rules for hosts
+
+What every host (the Android and iOS wallets, the Connector Extension) does around the sessions, so
+that they all behave the same. The rules that can be computed are in the library; the others
+depend on how each platform runs, and are described here.
+
+- **Starting many links at once** (a cold start, the app back in the front): start at once the
+  links for which `linkStartsAtOnce(linkMemory)` is true (new links, links connected in the last
+  day), and the others once those are connected, or after `laterLinksHeadStartMs()` (3 s) at most.
+  Starting every session together makes each of them slower: a radio just woken up carries all
+  their relay connections, lookups and handshakes, most of them for connectors that are not there.
+- **One session per link key at a time.** Two sessions of the same link and role (e.g. the
+  regular session of a link and the session of a linking that scans the same QR code again) have
+  the same endpoint key and take the link from each other at the relay. Stop the regular session
+  while the other one runs, and start it again once that one has shut down. A message the other
+  session took is confirmed to the peer already: hand it to the app like the regular session's.
+- **A wallet in the background** cannot approve requests: it may stop its sessions after a short
+  grace period (a quick look at another app should drop nothing), once the exchanges in progress
+  (a message being sent, a message taken but not yet handed to the app) are over, and start them
+  again when it comes back. Tell the connector with `setInBackground` meanwhile.
+- **`networkChanged()`** on every connectivity change and whenever the app comes back to the
+  front (see above).
 
 ## Diagnostics
 

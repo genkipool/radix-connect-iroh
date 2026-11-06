@@ -126,6 +126,23 @@ pub fn link_memory_connected_lately(text: &str) -> bool {
         .is_some_and(|at| now.saturating_sub(at) < DORMANT_AFTER.as_secs())
 }
 
+/// How long, at most, the links that do not start at once ([`link_starts_at_once`]) wait for
+/// the others to connect before they start too.
+pub const LATER_LINKS_HEAD_START: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Whether a host starting many links at once (a cold start, the app coming back to the front)
+/// starts the link whose stored memory is `link_memory` at once: no memory (a new link), or one
+/// connected lately ([`link_memory_connected_lately`]).
+///
+/// The others start once the links started at once are connected, or after
+/// [`LATER_LINKS_HEAD_START`] at most. Starting every session at once makes each of them slower:
+/// a radio just woken up carries all their relay connections, address lookups and handshakes
+/// together, most of them for connectors that are not there (measured: links that connect took
+/// 5-8 s instead of under one, with 7 dormant links out of 10).
+pub fn link_starts_at_once(link_memory: Option<&str>) -> bool {
+    link_memory.is_none_or(link_memory_connected_lately)
+}
+
 /// Seconds since the Unix epoch, or `None` when the clock is before it.
 pub(crate) fn unix_now() -> Option<u64> {
     SystemTime::now()
@@ -232,5 +249,23 @@ mod tests {
         assert!(link_memory_connected_lately(&memory(None, None)));
         assert!(link_memory_connected_lately(""));
         assert!(link_memory_connected_lately("{not json"));
+    }
+
+    #[test]
+    fn new_links_and_links_connected_lately_start_at_once() {
+        let now = unix_now().unwrap();
+        let day = DORMANT_AFTER.as_secs();
+        let memory = |last_connected: Option<u64>| {
+            LinkMemory {
+                peer_relay: None,
+                last_connected,
+                known_since: Some(now - 2 * day),
+            }
+            .to_text()
+        };
+        assert!(link_starts_at_once(None));
+        assert!(link_starts_at_once(Some(&memory(Some(now - 60)))));
+        assert!(!link_starts_at_once(Some(&memory(Some(now - day - 60)))));
+        assert!(!link_starts_at_once(Some(&memory(None))));
     }
 }
