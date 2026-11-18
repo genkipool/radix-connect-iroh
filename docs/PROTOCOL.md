@@ -259,10 +259,10 @@ link and given back as a hint) — connects to the wallet's endpoint id there wi
 - On n0's public relays the wallet publishes no address (§4): the connector can only knock
   at a relay it remembers, which costs the phone nothing and publishes nothing new. A
   wrong or outdated relay only means the knock does not arrive. The relay it remembers is
-  the one the wallet says it is on (§7.2, since 0.1.12): learnt from the connection
-  instead, it could be the relay that carried the connection — the connector's own, when
-  the wallet came to it there — and a wrong one was never corrected, since each knock sent
-  there made it look known.
+  the one the wallet says it is on (§7.2), not the one learnt from the connection: that
+  could be the relay that carried the connection (the connector's own, when the wallet came
+  to it there), and a wrong relay would never be corrected, since each knock sent there
+  would make it look known.
 
 ### 7.2 Presence and request inventory (datagrams)
 
@@ -306,7 +306,7 @@ connector find out when the wallet is back:
 The connector checks every 4 s that the wallet still answers (since 0.1.7; 0.1.6 only while
 its app was in the background), with the probe a network change runs and a 3 s deadline,
 and drops the connection when it does not: a closed wallet, which says nothing, is known
-gone within about 7 s instead of QUIC's 30, however its app was closed. A wallet that
+gone within 7–8 s instead of QUIC's 30, however its app was closed. A wallet that
 fails a check without being gone (frozen by the system, a moment without network) loses
 nothing — it redials, and lists its requests when it is back.
 
@@ -381,11 +381,19 @@ one-time Android JNI hand-over of the application context to iroh's DNS resolver
 
 ## 9. Compatibility and coexistence with WebRTC
 
-The transport is opt-in on both sides. Hosts may run WebRTC and iroh for the same link
+The transport is optional. A host may turn it off; the reference extension uses it only
+when its user turns it on (WebRTC stays its default), and so does the reference wallet,
+whose Automatic mode uses it for the links known to support it. Hosts may run WebRTC and iroh for the same link
 at the same time; each message is sent on exactly one transport (iroh when connected,
 otherwise WebRTC, falling back only when the first reports `notConnected`), and
 messages are accepted from both. Peers that do not speak iroh simply never connect
 over it.
+
+Over WebRTC the reference wallet carries what §7.2's datagrams say as JSON messages without
+an `interactionId` (`walletRequests`, `walletPresence`), and also sends `linkRemoved`. A
+wallet must not send such messages over WebRTC to a connector that is not known to support
+them: the released Connector Extension expects an `interactionId` on every wallet message.
+The reference wallet sends them over WebRTC only on links that have connected over iroh.
 
 ## 10. Diagnostics
 
