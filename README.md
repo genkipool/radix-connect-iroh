@@ -21,9 +21,14 @@ dApp requests and answers work the same over either transport.
 > author's coordinates (`io.github.genkipool`, `@genkipool`), see [Using it](#using-it).
 > Until the official wallet and extension support it, use it with development builds.
 
+## Try it
+
+Test builds of the wallet (Android APK) and the extension (Chrome ZIP), with install steps:
+**[docs/TESTERS.md](docs/TESTERS.md)**. They are community builds, not official Radix releases;
+never import your main seed phrase into them.
+
 Specification and security analysis: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Binding
 APIs: [`docs/BINDINGS.md`](docs/BINDINGS.md). Proposal to RDX Works: [`docs/PROPOSAL.md`](docs/PROPOSAL.md).
-Test builds of the wallet and the extension: [`docs/TESTERS.md`](docs/TESTERS.md).
 
 ## Why iroh
 
