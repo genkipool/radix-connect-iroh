@@ -1,0 +1,143 @@
+{
+  "formatVersion": "1.1",
+  "component": {
+    "group": "io.github.genkipool",
+    "module": "radix-connect-iroh-android",
+    "version": "0.2.0",
+    "attributes": {
+      "org.gradle.status": "release"
+    }
+  },
+  "createdBy": {
+    "gradle": {
+      "version": "8.14.3"
+    }
+  },
+  "variants": [
+    {
+      "name": "releaseVariantReleaseApiPublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-api"
+      },
+      "dependencies": [
+        {
+          "group": "net.java.dev.jna",
+          "module": "jna",
+          "version": {
+            "requires": "5.18.1"
+          },
+          "excludes": [
+            {
+              "group": "*",
+              "module": "*"
+            }
+          ],
+          "thirdPartyCompatibility": {
+            "artifactSelector": {
+              "name": "jna",
+              "type": "aar",
+              "extension": "aar"
+            }
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "radix-connect-iroh-android-0.2.0.aar",
+          "url": "radix-connect-iroh-android-0.2.0.aar",
+          "size": 14911008,
+          "sha512": "fb007695c9791a7d835c7a8b9fb6c47c19f72412597bd13419dfc0303750c44157eab25b41fe9daf7d41534f6dfefa049dc8c4d9a521128460c8dd30807f726c",
+          "sha256": "bf48d6d637360d5c963aca8c39b7c66f5b5daf9693b65c6e84558c4f4ad02b3d",
+          "sha1": "00ca5e4813dd1c7f1b7e1f74debc3ae054753422",
+          "md5": "f31cb317bdc3f53e005aa5228c7b63bf"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseRuntimePublication",
+      "attributes": {
+        "org.gradle.category": "library",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.libraryelements": "aar",
+        "org.gradle.usage": "java-runtime"
+      },
+      "dependencies": [
+        {
+          "group": "org.jetbrains.kotlinx",
+          "module": "kotlinx-coroutines-core",
+          "version": {
+            "requires": "1.10.2"
+          }
+        },
+        {
+          "group": "net.java.dev.jna",
+          "module": "jna",
+          "version": {
+            "requires": "5.18.1"
+          },
+          "excludes": [
+            {
+              "group": "*",
+              "module": "*"
+            }
+          ],
+          "thirdPartyCompatibility": {
+            "artifactSelector": {
+              "name": "jna",
+              "type": "aar",
+              "extension": "aar"
+            }
+          }
+        },
+        {
+          "group": "org.jetbrains.kotlin",
+          "module": "kotlin-stdlib",
+          "version": {
+            "requires": "2.2.0"
+          }
+        }
+      ],
+      "files": [
+        {
+          "name": "radix-connect-iroh-android-0.2.0.aar",
+          "url": "radix-connect-iroh-android-0.2.0.aar",
+          "size": 14911008,
+          "sha512": "fb007695c9791a7d835c7a8b9fb6c47c19f72412597bd13419dfc0303750c44157eab25b41fe9daf7d41534f6dfefa049dc8c4d9a521128460c8dd30807f726c",
+          "sha256": "bf48d6d637360d5c963aca8c39b7c66f5b5daf9693b65c6e84558c4f4ad02b3d",
+          "sha1": "00ca5e4813dd1c7f1b7e1f74debc3ae054753422",
+          "md5": "f31cb317bdc3f53e005aa5228c7b63bf"
+        }
+      ]
+    },
+    {
+      "name": "releaseVariantReleaseSourcePublication",
+      "attributes": {
+        "org.gradle.category": "documentation",
+        "org.gradle.dependency.bundling": "external",
+        "org.gradle.docstype": "sources",
+        "org.gradle.usage": "java-runtime"
+      },
+      "files": [
+        {
+          "name": "radix-connect-iroh-android-0.2.0-sources.jar",
+          "url": "radix-connect-iroh-android-0.2.0-sources.jar",
+          "size": 21066,
+          "sha512": "db4cd3a494e6a9c10540ff6ace9711f8775fabc099265bebfec208eb0c96e412c1b3e31a1c4591bc19d92e2ad2f11726a44fa41a239721b27f7475a91ef3f85d",
+          "sha256": "916698da0abbffe369a38558e262d68cb0d9110947a839c7745e52696b1219d2",
+          "sha1": "75bf3f1dbfd0e858b3d2235bdbf6f956454fa206",
+          "md5": "3df8b5c6e2c37da1a1387d7d15bc6646"
+        }
+      ]
+    }
+  ]
+}
