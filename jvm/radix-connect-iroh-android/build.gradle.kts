@@ -4,7 +4,8 @@ plugins {
     `maven-publish`
 }
 
-group = "com.radixdlt.connect"
+// The author's coordinates until a decision is taken on who publishes the library.
+group = providers.gradleProperty("radixConnectIroh.group").getOrElse("io.github.genkipool")
 // Overridable for local builds, e.g. -PradixConnectIroh.version=0.2.0-dev (publishToMavenLocal).
 version = providers.gradleProperty("radixConnectIroh.version").getOrElse("0.2.0")
 
@@ -122,6 +123,13 @@ val generateUniffiBindings by tasks.registering(Exec::class) {
 tasks.named("preBuild") { dependsOn(generateUniffiBindings, copyJniLibs) }
 
 publishing {
+    repositories {
+        // A plain Maven repository in a folder, published as the `maven` branch of the repository.
+        maven {
+            name = "folder"
+            url = uri(providers.gradleProperty("radixConnectIroh.repoDir").getOrElse("${'$'}{rootDir}/build/maven-repo"))
+        }
+    }
     publications {
         register<MavenPublication>("release") {
             artifactId = "radix-connect-iroh-android"

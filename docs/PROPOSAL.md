@@ -172,16 +172,17 @@ Chrome and n0's public relays.
 - A Connector Extension pull request that adds only the iroh transport, WebRTC staying its
   default.
 
-**Before either can be merged,** the library must be published somewhere their builds can
-download it from. Today it is only in a local Maven repository and a local npm package.
+The library is published under the author's names (see decision 2), so both pull requests build
+without anything local.
 
 ## Decisions for RDX Works
 
 1. **Is iroh wanted as a second, opt-in transport?**
-2. **Who publishes and maintains the library?** Its package names (`com.radixdlt.connect`,
-   `@radixdlt/radix-connect-iroh`) are only proposals and are not published. Options:
-   - RDX Works adopts the repository;
-   - the author publishes it under their own names, and keeps it up to date.
+2. **Who publishes and maintains the library?** Today the author publishes it as
+   `io.github.genkipool:radix-connect-iroh-android` (a Maven repository on GitHub) and
+   `@genkipool/radix-connect-iroh` (a package on the GitHub release). Options:
+   - RDX Works adopts the repository and publishes it under its own names;
+   - the author keeps publishing it and keeps it up to date.
 3. **Relays.** n0's public relays, relays run by RDX Works, or both.
 4. **iOS.** The library has not been built for iOS yet. One option is to put the shared rules in
    Sargon and the library, so that the iOS wallet mostly adds platform code and UI.

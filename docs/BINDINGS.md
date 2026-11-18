@@ -31,7 +31,7 @@ messages). No chunking, no `packageType` envelope.
 
 ## Kotlin (Android) — `com.radixdlt.connect.iroh`
 
-Artifact: `com.radixdlt.connect:radix-connect-iroh-android:<version>` (AAR with
+Artifact: `io.github.genkipool:radix-connect-iroh-android:<version>` (AAR with
 `libradix_connect_iroh_uniffi.so` for arm64-v8a, armeabi-v7a, x86_64, x86; depends
 on JNA and kotlinx-coroutines).
 
@@ -85,14 +85,14 @@ object RadixConnectIrohAndroid {
 }
 ```
 
-## TypeScript (browser, wasm) — `@radixdlt/radix-connect-iroh`
+## TypeScript (browser, wasm) — `@genkipool/radix-connect-iroh`
 
 `wasm-bindgen --target web` output. Extension pages need
 `script-src 'self' 'wasm-unsafe-eval'` in the manifest CSP.
 
 ```ts
-import init, { IrohSession, publicRelayUrls, endpointId, setLogger } from '@radixdlt/radix-connect-iroh'
-import wasmUrl from '@radixdlt/radix-connect-iroh/radix_connect_iroh_bg.wasm?url'
+import init, { IrohSession, publicRelayUrls, endpointId, setLogger } from '@genkipool/radix-connect-iroh'
+import wasmUrl from '@genkipool/radix-connect-iroh/radix_connect_iroh_bg.wasm?url'
 
 await init({ module_or_path: wasmUrl }) // once per page
 

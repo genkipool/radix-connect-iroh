@@ -1,5 +1,5 @@
 {
-  "name": "@radixdlt/radix-connect-iroh",
+  "name": "@genkipool/radix-connect-iroh",
   "version": "0.2.0",
   "description": "Radix Connect over iroh for browsers: the Connector Extension's side of the iroh transport (WebAssembly).",
   "license": "Apache-2.0",

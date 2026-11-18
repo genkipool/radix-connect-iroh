@@ -17,8 +17,8 @@ dApp requests and answers work the same over either transport.
   generate Swift, but the library has not been built or tested for iOS yet (see [iOS](#ios)).
 
 > **Status:** community project, proposed to RDX Works for the Radix Wallet and the
-> Radix Connector Extension; not an official Radix package. The `com.radixdlt` and
-> `@radixdlt` package coordinates below are the proposed ones and are not published.
+> Radix Connector Extension; not an official Radix package. It is published under the
+> author's coordinates (`io.github.genkipool`, `@genkipool`), see [Using it](#using-it).
 > Until the official wallet and extension support it, use it with development builds.
 
 Specification and security analysis: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Binding
@@ -103,9 +103,29 @@ Chrome, using n0's public relays.
 | `crates/radix-connect-iroh` | Protocol core: key derivation, admission, message exchange, session with reconnection |
 | `crates/radix-connect-iroh-uniffi` | Kotlin bindings (`libradix_connect_iroh_uniffi`; Swift not built yet) |
 | `crates/radix-connect-iroh-wasm` | Browser bindings |
-| `jvm/` | Gradle project producing the Android library `com.radixdlt.connect:radix-connect-iroh-android` |
-| `js/` | npm package `@radixdlt/radix-connect-iroh` |
+| `jvm/` | Gradle project producing the Android library `io.github.genkipool:radix-connect-iroh-android` |
+| `js/` | npm package `@genkipool/radix-connect-iroh` |
 | `scripts/` | wasm build and the cross-implementation end-to-end test |
+
+## Using it
+
+Android (a plain Maven repository, no account needed):
+
+```groovy
+repositories {
+    maven {
+        url "https://raw.githubusercontent.com/genkipool/radix-connect-iroh/maven"
+        content { includeGroup "io.github.genkipool" }
+    }
+}
+dependencies { implementation "io.github.genkipool:radix-connect-iroh-android:0.2.0" }
+```
+
+Browser (npm package attached to the GitHub release):
+
+```json
+"@genkipool/radix-connect-iroh": "https://github.com/genkipool/radix-connect-iroh/releases/download/v0.2.0/genkipool-radix-connect-iroh-0.2.0.tgz"
+```
 
 ## Building
 
