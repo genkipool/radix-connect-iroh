@@ -1,11 +1,11 @@
 # Proposal: Radix Connect over iroh
 
-*Status: proposal for RDX Works. Author: genkipool. Draft, 2026-11-18.*
+*Status: proposal for the Radix maintainers. Author: genkipool. Draft, 2026-11-18.*
 
 ## In one paragraph
 
 Radix Connect links the Radix Wallet with the Connector Extension, and through it with every
-dApp in the browser. Today that link is a WebRTC data channel, set up through RDX Works'
+dApp in the browser. Today that link is a WebRTC data channel, set up through the Radix
 signaling server. This proposal **adds** [iroh](https://iroh.computer) as a second,
 **opt-in** transport for the same link. It carries the same messages and keeps the existing QR
 codes and linked connectors. WebRTC stays, and stays the default: a user who does not turn
@@ -27,7 +27,7 @@ This proposal uses iroh 1.4.1.
 
 ### 1. A link that does not need the signaling server
 
-Today, every WebRTC connection is set up through RDX Works' signaling server, with STUN and
+Today, every WebRTC connection is set up through the Radix signaling server, with STUN and
 often TURN servers to cross NATs. (STUN tells a device its public address; TURN forwards the
 traffic when no direct path exists.) If the signaling server is down or blocked, no link can
 be set up.
@@ -35,12 +35,12 @@ be set up.
 An iroh link needs only a relay, reached over HTTPS. This means:
 - links keep working when the signaling server is down;
 - links work on networks that block UDP, where WebRTC needs a TURN server;
-- RDX Works, or any user, can run the whole path with one relay program.
+- the Radix project, or any user, can run the whole path with one relay program.
 
 What this depends on:
 - This applies to links in **iroh only** mode. In **Automatic** mode WebRTC keeps running next
   to iroh.
-- With n0's public relays, the dependency moves from RDX Works' servers to n0's. n0's address
+- With n0's public relays, the dependency moves from the Radix signaling servers to n0's. n0's address
   lookup then stores which relay a connector uses (never its IP address). With a self-hosted
   relay, nothing else is involved.
 - The keys come from the link's existing password, so links created before iroh existed work
@@ -143,7 +143,7 @@ Full specification and security analysis: [PROTOCOL.md](PROTOCOL.md).
 - **Third-party relays by default.** n0 runs the public relays and the address lookup. A relay
   sees which endpoint ids (public keys) talk, their IP addresses and when they are online, as a
   signaling or TURN server does today. A self-hosted relay avoids this. n0's terms, limits and
-  availability for its public relays would need to be checked by RDX Works.
+  availability for its public relays would need to be checked by the Radix maintainers.
 - **The browser is always relayed,** because WebAssembly cannot use UDP directly.
 - **App size.** The native library adds, per CPU architecture (ABI), uncompressed: arm64 8.7 MB, armeabi-v7a
   5.5 MB, x86_64 9.6 MB, x86 10.0 MB. Compressed, arm64 is 3.6 MB. Current Android packaging
@@ -175,15 +175,15 @@ Chrome and n0's public relays.
 The library is published under the author's names (see decision 2), so both pull requests build
 without anything local.
 
-## Decisions for RDX Works
+## Decisions for the Radix maintainers
 
 1. **Is iroh wanted as a second, opt-in transport?**
 2. **Who publishes and maintains the library?** Today the author publishes it as
    `io.github.genkipool:radix-connect-iroh-android` (a Maven repository on GitHub) and
    `@genkipool/radix-connect-iroh` (a package on the GitHub release). Options:
-   - RDX Works adopts the repository and publishes it under its own names;
+   - the Radix project adopts the repository and publishes it under its own names;
    - the author keeps publishing it and keeps it up to date.
-3. **Relays.** n0's public relays, relays run by RDX Works, or both.
+3. **Relays.** n0's public relays, relays run by the Radix project, or both.
 4. **iOS.** The library has not been built for iOS yet. One option is to put the shared rules in
    Sargon and the library, so that the iOS wallet mostly adds platform code and UI.
 5. **Review.** A security review of iroh and its dependencies.

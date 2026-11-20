@@ -1,8 +1,8 @@
 # Test builds: Radix Wallet and Connector Extension with Radix Connect over iroh
 
 Community test builds of the Radix Wallet (Android) and the Radix Connector Extension (Chrome).
-They are **not official Radix releases**: they are not reviewed or endorsed by RDX Works and
-come with no warranty. See the [proposal](PROPOSAL.md) for what iroh adds.
+They are **not official Radix releases**: they are not reviewed or endorsed by the Radix
+maintainers and come with no warranty. See the [proposal](PROPOSAL.md) for what iroh adds.
 
 > **Never import your main seed phrase into these builds.** Create a new wallet, or import a
 > wallet that holds only small test amounts. Stokenet (the test network) is the best choice.

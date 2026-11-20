@@ -16,8 +16,8 @@ dApp requests and answers work the same over either transport.
   wallet, WebAssembly bindings (wasm-bindgen) for the browser extension. uniffi can also
   generate Swift, but the library has not been built or tested for iOS yet (see [iOS](#ios)).
 
-> **Status:** community project, proposed to RDX Works for the Radix Wallet and the
-> Radix Connector Extension; not an official Radix package. It is published under the
+> **Status:** community project, proposed to the Radix maintainers for the Radix Wallet
+> and the Radix Connector Extension; not an official Radix package. It is published under the
 > author's coordinates (`io.github.genkipool`, `@genkipool`), see [Using it](#using-it).
 > Until the official wallet and extension support it, use it with development builds.
 
@@ -28,7 +28,8 @@ Test builds of the wallet (Android APK) and the extension (Chrome ZIP), with ins
 never import your main seed phrase into them.
 
 Specification and security analysis: [`docs/PROTOCOL.md`](docs/PROTOCOL.md). Binding
-APIs: [`docs/BINDINGS.md`](docs/BINDINGS.md). Proposal to RDX Works: [`docs/PROPOSAL.md`](docs/PROPOSAL.md).
+APIs: [`docs/BINDINGS.md`](docs/BINDINGS.md). Proposal to the Radix maintainers:
+[`docs/PROPOSAL.md`](docs/PROPOSAL.md).
 
 ## Why iroh
 
