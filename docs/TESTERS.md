@@ -9,7 +9,7 @@ maintainers and come with no warranty. See the [proposal](PROPOSAL.md) for what 
 
 | Build | Where | File |
 |---|---|---|
-| Android wallet 1.22.3-iroh.2 | [genkipool/babylon-wallet-android releases](https://github.com/genkipool/babylon-wallet-android/releases/tag/tester-1.22.3-iroh.2) | `radix-wallet-iroh-test-1.22.3-iroh.2.apk` |
+| Android wallet 1.22.3-iroh.3 | [genkipool/babylon-wallet-android releases](https://github.com/genkipool/babylon-wallet-android/releases/tag/tester-1.22.3-iroh.3) | `radix-wallet-iroh-test-1.22.3-iroh.3.apk` |
 | Chrome extension 0.3.0 | [genkipool/connector-extension releases](https://github.com/genkipool/connector-extension/releases/tag/tester-0.3.0) | `connector-extension-iroh-test-0.3.0.zip` |
 
 Each release lists the SHA-256 of its file and links the source branch it was built from.
@@ -20,8 +20,12 @@ Each release lists the SHA-256 of its file and links the source branch it was bu
 - **Radix Connect over iroh**: Settings → Preferences → Radix Connect: Automatic (the default
   in this build), WebRTC only or iroh only, and the relay. By default iroh goes through n0's
   public relays; you can set your own.
-- **Badges for restricted tokens**: a transfer of a token that needs a badge shows the badge
-  and attaches its proof automatically.
+- **Badges for restricted tokens and NFTs**: a transfer of an asset that needs a badge shows
+  the badge and attaches its proof automatically; an asset that cannot be withdrawn, or a
+  missing badge, blocks the transfer with a message.
+- **Links come back by themselves**: a link that died while the app was in the background is
+  reopened when it returns; a dApp answer is still delivered when the request screen closes;
+  removing a connector also removes the link in the tester extension.
 - Fixes: WebRTC messages no longer interleave or get lost, every data channel is read, a
   persona-only proof of ownership completes, sharing a persona without the data asked for no
   longer closes the app, transaction guarantees are inserted once, and rejecting queued dApp
